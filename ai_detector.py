@@ -16,7 +16,10 @@ except ImportError:
     HAS_ONNX = False
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-SCRFD_URL = "https://huggingface.co/public-data/insightface/resolve/main/models/scrfd_2.5g/scrfd_2.5g_bnkps.onnx"
+# 使用已有的UltraLight模型（1.5MB，已下载）
+FACE_MODEL_PATH = os.path.join(MODEL_DIR, 'ultraface_rfb_640.onnx')
+# SCRFD备用（需另外下载）
+SCRFD_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/scrfd_person_2.5g.onnx"
 SCRFD_PATH = os.path.join(MODEL_DIR, 'scrfd_2.5g_bnkps.onnx')
 
 # ═══════════════════════════════════════════
@@ -357,24 +360,51 @@ class QualityAnalyzer:
         return score
 
     def suggest(self, score, scene, face_count, blur_type=''):
-        """生成改进建议"""
         tips = []
-        if score['tech']['sharpness'] < 50:
-            tips.append('照片较模糊' + (f'({blur_type})' if blur_type else '，建议重拍'))
-        if score['tech']['exposure'] < 50:
-            tips.append('曝光不理想，建议调整曝光补偿或后期修正')
-        if score['composition']['rule_of_thirds'] < 40:
-            tips.append('构图可优化，建议将主体置于三分线位置')
-        if score['portrait'].get('eyes', 100) < 40:
-            tips.append('检测到人物闭眼或眯眼，建议重拍')
-        if score['portrait'].get('angle', 100) < 50:
-            tips.append('人脸角度偏大，建议正面拍摄')
+        tech = score.get('tech', {})
+        comp = score.get('composition', {})
+        port = score.get('portrait', {})
+        ov = score.get('overall', 0)
+
+        # 技术类建议
+        sh = tech.get('sharpness', 100)
+        ex = tech.get('exposure', 100)
+        if sh < 30: tips.append(f'画面严重模糊(清晰度{sh:.0f}/100)，建议重新拍摄')
+        elif sh < 55: tips.append(f'照片略有模糊(清晰度{sh:.0f}/100)，可尝试后期锐化')
+        if ex < 30: tips.append(f'曝光严重不足或过曝({ex:.0f}/100)，建议调整曝光重拍')
+        elif ex < 55: tips.append(f'曝光略有问题({ex:.0f}/100)，后期调光可改善')
+
+        # 构图建议
+        rt = comp.get('rule_of_thirds', 100)
+        bal = comp.get('balance', 100)
+        if rt < 25: tips.append('构图主体不突出，建议将拍摄对象放在画面1/3处')
+        elif rt < 45: tips.append('构图尚可优化，略微调整角度让主体更突出')
+        if bal < 40: tips.append('画面左右亮度不均衡，可后期调整')
+
+        # 人像建议(按场景细分)
+        if face_count > 0:
+            eyes = port.get('eyes', 100)
+            angle = port.get('angle', 100)
+            if eyes < 20: tips.append(f'人物严重闭眼(睁眼度{eyes:.0f}%)，建议删除此照片')
+            elif eyes < 50: tips.append(f'人物可能眯眼(睁眼度{eyes:.0f}%)，表情不够理想')
+            if angle < 30: tips.append('人脸角度偏大，正面照效果更好')
+            if scene == '集体照' and face_count > 5:
+                tips.append('集体照人数较多，建议检查是否有人被遮挡或表情不佳')
+            elif scene == '人像写真' and face_count == 1:
+                tips.append('人像照建议检查眼神光是否到位')
+
+        # 场景特化建议
+        if scene == '风景风光' and rt < 50: tips.append('风光照建议使用三分法将地平线放在上1/3或下1/3')
+        if scene == '美食探店' and ex < 60: tips.append('美食照片推荐使用暖色调和适当补光提升食欲感')
+        if scene == '室内空间' and ex < 50: tips.append('室内光线不足，建议使用三脚架或补光灯')
+
+        # 综合
         if not tips:
-            if score['overall'] >= 85:
-                tips.append('整体质量良好，可直接使用')
-            else:
-                tips.append('整体质量中规中矩，可用于日常分享')
-        return tips
+            if ov >= 90: tips.append('✨ 此照片质量优秀，构图曝光俱佳，可直接使用')
+            elif ov >= 75: tips.append('照片整体不错，细节处可微调后使用')
+            elif ov >= 55: tips.append('照片质量一般，建议筛选后择优使用')
+            else: tips.append('照片综合质量较低，建议重新拍摄')
+        return tips[:4]  # 最多4条
 
 
 # ═══════════════════════════════════════════
@@ -397,9 +427,9 @@ class AIDetector:
         if ok:
             try:
                 self.face_detector = SCRFD(SCRFD_PATH)
-                if self.progress_cb: self.progress_cb("SCRFD 就绪 ✓")
+                if self.progress_cb: self.progress_cb("SCRFD人脸检测就绪")
             except Exception as e:
-                if self.progress_cb: self.progress_cb(f"SCRFD失败: {e}")
+                if self.progress_cb: self.progress_cb(f"SCRFD加载失败: {e}")
 
     def detect_faces(self, img):
         if self.face_detector:
