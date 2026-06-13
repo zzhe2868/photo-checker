@@ -7,21 +7,15 @@
 - **tkinter** — 桌面GUI界面
 - **NumPy** — 直方图曝光分析
 
-## 快速开始
-
-`ash
 # 安装依赖
 py -m pip install opencv-python numpy -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout=100
 
 # 运行
-py photo_checker.py
-`
-
-或双击 启动照片检测.bat
+py photo_checker.py或双击 启动照片检测.bat
 
 ## 功能
 1. 选择照片文件夹，批量扫描
-2. AI 检测三类废片并显示原因
+2. 机械检测三类废片并显示原因
 3. 实时进度条 + 废片统计
 4. 一键将废片移动到 _废片/ 文件夹
 5. 完全本地离线，不联网不上传
