@@ -1,5 +1,5 @@
 """
-图片智能分析系统 v2.0 - 电竞暗黑美学
+图片智能分析系统 v4.2 - 电竞暗黑美学
 SCRFD人脸 · 多维评分 · 场景分类 · 本地离线
 """
 import os, sys, shutil, csv, configparser, threading, time
@@ -120,7 +120,7 @@ class PhotoChecker:
 # ═══════════════════════════════════════════
 class App:
     def __init__(self, root):
-        self.root=root; self.root.title("图片智能分析系统 v2.0")
+        self.root=root; self.root.title("图片智能分析系统 v4.2")
         self.root.geometry("1200x800"); self.root.minsize(1000,640)
         self.root.configure(bg=BG0)
         self.cfg=Config(); self.checker=PhotoChecker(self.cfg)
@@ -234,7 +234,7 @@ class App:
         self.tdup.pack(fill='x')
         self.tdup.bind('<Double-1>',self._dup_detail)
 
-        self.st=tk.Label(r,text="v2.0 | SCRFD | AI仅供参考",font=('微软雅黑',8),fg=TEXT2,bg=BG0,anchor='w')
+        self.st=tk.Label(r,text="v4.2 | SCRFD | AI仅供参考",font=('微软雅黑',8),fg=TEXT2,bg=BG0,anchor='w')
         self.st.pack(side='bottom',fill='x',padx=8)
 
     def _build_param_panel(self):
@@ -624,7 +624,7 @@ class App:
                     shutil.move(src,dst); self.move_hist.append((src,dst)); moved+=1
             except: pass
         self.st.config(text=f"✓ 已移动 {moved} 张到 _废片/")
-        self.root.after(3000,lambda: self.st.config(text="v2.0 | AI仅供参考"))
+        self.root.after(3000,lambda: self.st.config(text="v4.2 | AI仅供参考"))
 
     def _undo(self):
         if not self.move_hist: self.st.config(text="无可撤销"); return
@@ -635,7 +635,7 @@ class App:
             except: pass
         self.move_hist.clear()
         self.st.config(text=f"✓ 已恢复 {r} 张")
-        self.root.after(3000,lambda: self.st.config(text="v2.0 | AI仅供参考"))
+        self.root.after(3000,lambda: self.st.config(text="v4.2 | AI仅供参考"))
 
     def _csv(self):
         if not self.results: self.st.config(text="无结果可导出"); return
