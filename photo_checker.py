@@ -1,277 +1,162 @@
 """
-照片废片检测工具 v4.0 — AI 增强版
-检测: 模糊(类型) / 闭眼 / 曝光 / 重复 / AI美学 / AI人脸质量
-特性: ONNX Runtime · UltraLight · 美学评分 · 模糊分类
+照片质量智能分析系统 v4.1
+SCRFD人脸 · 多维评分 · 场景分类 · 分析报告
 """
 
-import os, sys, shutil, csv, configparser, threading
+import os, sys, shutil, csv, configparser, threading, json
 from datetime import datetime
 from pathlib import Path
-from io import BytesIO
 
 import cv2, numpy as np
 
-# ── GUI ──
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# 高DPI
 try:
     from ctypes import windll
     windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    pass
+except: pass
 
-try:
-    import ttkbootstrap as tkb
-    HAS_BOOTSTRAP = True
-except ImportError:
-    HAS_BOOTSTRAP = False
+try: import ttkbootstrap as tkb; HAS_TKB = True
+except: HAS_TKB = False
 
-try:
-    from PIL import Image, ImageTk
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
+try: from PIL import Image, ImageTk, ExifTags; HAS_PIL = True
+except: HAS_PIL = False
 
-# ── AI 模块 ──
-from ai_detector import AIDetector
-
+from ai_detector import AIDetector, HAS_ONNX
 
 # ═══════════════════════════════════════════
-# 配置
-# ═══════════════════════════════════════════
+CONFIG_DEFAULTS = {
+    'blur_threshold':'80','overexposure_pct':'80','underexposure_pct':'18',
+    'over_brightness':'240','under_brightness':'30','duplicate_threshold':'95',
+    'max_image_dim':'1200','aesthetic_min':'3.0','theme':'darkly',
+    'last_folder':'','enable_ai':'1','ai_mode':'','api_key':'','api_endpoint':'','api_model':'',
+}
 
 class Config:
-    DEFAULTS = {
-        'blur_threshold': '100',
-        'overexposure_pct': '80',
-        'underexposure_pct': '18',
-        'over_brightness': '240',
-        'under_brightness': '30',
-        'duplicate_threshold': '95',
-        'max_image_dim': '1200',
-        'aesthetic_min': '4.0',
-        'theme': 'darkly',
-        'last_folder': '',
-        'enable_ai': '1',
-    }
-
     def __init__(self):
-        base = getattr(sys, '_MEIPASS', '') or os.path.dirname(os.path.abspath(__file__))
-        self.path = os.path.join(base, 'config.ini')
+        base = getattr(sys,'_MEIPASS','') or os.path.dirname(os.path.abspath(__file__))
+        self.path = os.path.join(base,'config.ini')
         self.cfg = configparser.ConfigParser()
         self.load()
-
     def load(self):
         self.cfg.read(self.path, encoding='utf-8')
-        if 'settings' not in self.cfg:
-            self.cfg['settings'] = {}
-
+        if 'settings' not in self.cfg: self.cfg['settings'] = {}
     def save(self):
-        with open(self.path, 'w', encoding='utf-8') as f:
-            self.cfg.write(f)
+        with open(self.path,'w',encoding='utf-8') as f: self.cfg.write(f)
+    def g(self,k): return self.cfg['settings'].get(k,CONFIG_DEFAULTS.get(k,''))
+    def gf(self,k): return float(self.g(k))
+    def gi(self,k): return int(float(self.g(k)))
+    def gb(self,k): return self.g(k)=='1'
+    def s(self,k,v): self.cfg['settings'][k]=str(v); self.save()
 
-    def get(self, k):
-        return self.cfg['settings'].get(k, self.DEFAULTS.get(k, ''))
-
-    def get_float(self, k):
-        return float(self.get(k))
-
-    def get_int(self, k):
-        return int(float(self.get(k)))
-
-    def get_bool(self, k):
-        return self.get(k) == '1'
-
-    def set(self, k, v):
-        self.cfg['settings'][k] = str(v)
-        self.save()
-
-
-# ═══════════════════════════════════════════
-# 检测引擎（传统 + AI）
 # ═══════════════════════════════════════════
 
 class PhotoChecker:
-    def __init__(self, config: Config):
-        self.cfg = config
-        self.ai = None  # 延迟初始化
-
-        cascade_path = cv2.data.haarcascades
-        self.face_cascade = cv2.CascadeClassifier(
-            os.path.join(cascade_path, 'haarcascade_frontalface_default.xml'))
-        self.eye_cascade = cv2.CascadeClassifier(
-            os.path.join(cascade_path, 'haarcascade_eye.xml'))
-
-    def init_ai(self, progress_cb=None):
-        if self.ai is None and self.cfg.get_bool('enable_ai'):
-            self.ai = AIDetector(enable_ai=True, progress_callback=progress_cb)
-
+    def __init__(self, cfg: Config):
+        self.cfg = cfg; self.ai = None
+    def init_ai(self, cb=None):
+        if self.ai is None and self.cfg.gb('enable_ai'):
+            self.ai = AIDetector(enable_ai=True, progress_cb=cb)
     @staticmethod
-    def _imread(path):
-        arr = np.fromfile(path, dtype=np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-
-    # ── 模糊（分类） ──
-    def check_blur(self, gray):
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        thresh = self.cfg.get_float('blur_threshold')
-        is_bad = variance < thresh
-        conf = max(0, min(100, (1 - variance / thresh) * 100)) if thresh > 0 else 0
-
-        # AI 模糊分类
-        blur_type = ''
-        if self.ai and is_bad:
-            bc = self.ai.classify_blur(gray)
-            blur_type = {'defocus': '失焦模糊', 'motion_blur': '运动模糊',
-                         'bokeh': '背景虚化✓', 'sharp': ''}.get(bc['type'], '')
-
-        return is_bad, round(variance, 1), round(conf, 1), blur_type
-
-    # ── 人脸质量 ──
-    def check_faces(self, gray, img_rgb):
-        """返回 (face_issues, face_quality_score)"""
-        issues = []
-        face_boxes_trad = []
-
-        # AI 人脸检测
-        if self.ai and self.ai.face_detector:
-            try:
-                dets = self.ai.detect_faces(img_rgb)
-                if dets:
-                    face_boxes_trad = [(d[0], d[1], d[2], d[3], d[4]) for d in dets[:5]]
-            except Exception:
-                pass
-
-        # 回退 Haar
-        if not face_boxes_trad:
-            faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(80, 80))
-            face_boxes_trad = [(x, y, x+w, y+h, 1.0) for (x, y, w, h) in faces[:5]]
-
-        if not face_boxes_trad:
-            return issues, 100.0, []
-
-        face_qualities = []
-
-        for fb in face_boxes_trad[:3]:
-            x1, y1, x2, y2, conf = fb
-            x1 = int(max(0, x1)); y1 = int(max(0, y1))
-            x2 = int(min(gray.shape[1], x2)); y2 = int(min(gray.shape[0], y2))
-
-            # AI 人脸质量分析
-            if self.ai:
-                quality = self.ai.analyze_face_quality(gray, (x1, y1, x2, y2))
-            else:
-                # 简易版
-                upper = gray[y1:y2, x1:x2]
-                if upper.size > 100:
-                    fh = y2 - y1
-                    eyes = self.eye_cascade.detectMultiScale(upper[:fh//2, :], 1.05, 4, minSize=(10, 10))
-                    eye_open = min(len(eyes), 2) / 2 * 100
-                else:
-                    eye_open = 100
-                quality = {'eye_open': eye_open, 'head_angle': 0,
-                           'lighting_score': 80, 'overall': eye_open * 0.5 + 50}
-
-            face_qualities.append(quality)
-
-            if quality['eye_open'] < 50:
-                issues.append({'type': '闭眼', 'conf': round(100 - quality['eye_open'], 1),
-                               'detail': f"眼睛张开{quality['eye_open']:.0f}%"})
-            if quality['head_angle'] > 30:
-                issues.append({'type': '侧脸', 'conf': round(quality['head_angle'], 1),
-                               'detail': f"偏转{quality['head_angle']:.0f}°"})
-            if quality['lighting_score'] < 40:
-                issues.append({'type': '人脸光照不均', 'conf': round(100 - quality['lighting_score'], 1),
-                               'detail': f"均匀度{quality['lighting_score']:.0f}"})
-
-        avg_quality = (sum(q['overall'] for q in face_qualities) /
-                       len(face_qualities)) if face_qualities else 100.0
-
-        return issues, round(avg_quality, 1), face_qualities
-
-    # ── 曝光 ──
-    def check_exposure(self, gray):
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        total = gray.size
-        over = np.sum(hist[self.cfg.get_int('over_brightness'):]) / total * 100
-        under = np.sum(hist[:self.cfg.get_int('under_brightness')]) / total * 100
-
-        if over > self.cfg.get_float('overexposure_pct'):
-            return True, round(over, 1), '过曝'
-        if under > self.cfg.get_float('underexposure_pct'):
-            return True, round(under, 1), '欠曝'
-        return False, 0, '正常'
-
-    # ── pHash ──
+    def _imread(p):
+        a = np.fromfile(p, dtype=np.uint8)
+        return cv2.imdecode(a, cv2.IMREAD_COLOR)
     @staticmethod
     def compute_phash(gray):
-        resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
-        dct = cv2.dct(np.float32(resized))
-        top = dct[:8, :8]
-        avg = top.mean()
+        r = cv2.resize(gray,(32,32),interpolation=cv2.INTER_AREA)
+        d = cv2.dct(np.float32(r))[:8,:8]
         h = 0
-        for b in (top > avg).flatten():
-            h = (h << 1) | int(b)
-        return format(h, '016x')
-
+        for b in (d>d.mean()).flatten(): h=(h<<1)|int(b)
+        return format(h,'016x')
     @staticmethod
-    def hamming_distance(h1, h2):
-        return bin(int(h1, 16) ^ int(h2, 16)).count('1')
+    def hamming(a,b): return bin(int(a,16)^int(b,16)).count('1')
 
-    # ── 完整检测 ──
-    def check_single(self, filepath):
-        r = {"file": os.path.basename(filepath), "issues": [], "phash": None,
-             "aesthetic": 0, "face_quality": 100.0}
+    def check_single(self, path):
+        r = {'file':os.path.basename(path),'issues':[],'phash':None,
+             'aesthetic':0,'overall':0,'scene':'','suggestions':[],
+             'face_count':0,'face_results':[]}
 
-        img = self._imread(filepath)
-        if img is None:
-            r["issues"].append({"type": "读取失败", "conf": 100, "detail": "无法解码"})
-            return r
+        img = self._imread(path)
+        if img is None: r['issues'].append({'t':'读取失败','c':100,'d':'无法解码'}); return r
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h,w = gray.shape
+        md = self.cfg.gi('max_image_dim')
+        if max(h,w)>md:
+            s = md/max(h,w); gray=cv2.resize(gray,(int(w*s),int(h*s)))
+            rgb=cv2.resize(rgb,(int(w*s),int(h*s))); h,w=gray.shape
 
-        h, w = gray.shape
-        max_dim = self.cfg.get_int('max_image_dim')
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            gray = cv2.resize(gray, (int(w * scale), int(h * scale)))
-            img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)))
+        # 传统检测
+        lap = cv2.Laplacian(gray,cv2.CV_64F).var()
+        bt = self.cfg.gf('blur_threshold')
+        if lap<bt:
+            bc=''
+            if lap<30: bc='失焦模糊'
+            elif lap<60: bc='运动模糊'
+            r['issues'].append({'t':'模糊','c':round(max(0,(1-lap/bt)*100),1),
+                                'd':f"方差={lap:.0f} {bc}"})
 
-        # 1. 美学评分
+        hist = cv2.calcHist([gray],[0],None,[256],[0,256]); tot=gray.size
+        over = np.sum(hist[self.cfg.gi('over_brightness'):])/tot*100
+        under = np.sum(hist[:self.cfg.gi('under_brightness')])/tot*100
+        if over>self.cfg.gf('overexposure_pct'):
+            r['issues'].append({'t':'过曝','c':round(over,1),'d':f"{over:.0f}%过亮"})
+        if under>self.cfg.gf('underexposure_pct'):
+            r['issues'].append({'t':'欠曝','c':round(under,1),'d':f"{under:.0f}%过暗"})
+
+        # AI 分析
         if self.ai:
-            r['aesthetic'] = self.ai.score_aesthetic(img_rgb)
-            min_aes = self.cfg.get_float('aesthetic_min')
-            if r['aesthetic'] < min_aes:
-                r['issues'].append({'type': '美学', 'conf': round((min_aes - r['aesthetic']) / min_aes * 100, 1),
-                                    'detail': f"得分 {r['aesthetic']}/{min_aes}"})
+            face_dets = self.ai.detect_faces(rgb)
+            r['face_count'] = len(face_dets) if face_dets else 0
 
-        # 2. 模糊
-        bad, val, conf, btype = self.check_blur(gray)
-        if bad:
-            detail = f"方差={val}"
-            if btype: detail += f" [{btype}]"
-            r['issues'].append({'type': '模糊', 'conf': conf, 'detail': detail})
+            if face_dets:
+                for fd in face_dets[:10]:
+                    fq = self.ai.analyze_face(fd)
+                    r['face_results'].append(fq)
+                    if fq['eyes_open']<40:
+                        r['issues'].append({'t':'闭眼','c':round(100-fq['eyes_open'],1),
+                                            'd':f"睁眼度{fq['eyes_open']:.0f}%"})
+                    if fq['head_angle']>30:
+                        r['issues'].append({'t':'侧脸','c':round(fq['head_angle'],1),
+                                            'd':f"偏转{fq['head_angle']:.0f}°"})
 
-        # 3. 人脸
-        face_issues, face_q, _ = self.check_faces(gray, img_rgb)
-        r['face_quality'] = face_q
-        for fi in face_issues:
-            r['issues'].append(fi)
+            r['scene'] = self.ai.classify_scene(rgb, r['face_count'])
+            quality = self.ai.analyze_quality(rgb, gray, r['face_results'])
+            r['overall'] = quality.get('overall',0)
+            r['aesthetic'] = quality.get('aesthetic',0)
+            r['grade'] = quality.get('grade','')
+            r['quality'] = quality
+            r['suggestions'] = self.ai.suggest(quality, r['scene'], r['face_count'])
 
-        # 4. 曝光
-        bad, conf, detail = self.check_exposure(gray)
-        if bad:
-            r['issues'].append({'type': '曝光', 'conf': conf, 'detail': detail})
+            min_aes = self.cfg.gf('aesthetic_min')
+            if r['overall'] < 55:
+                r['issues'].append({'t':'综合评分低','c':round(55-r['overall'],1),
+                                    'd':f"得分{r['overall']:.0f}/100"})
+        else:
+            # 传统回退
+            face = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades,'haarcascade_frontalface_default.xml'))
+            eye  = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades,'haarcascade_eye.xml'))
+            faces = face.detectMultiScale(gray,1.1,5,minSize=(80,80))
+            r['face_count'] = len(faces)
+            if len(faces)>0:
+                r['scene'] = '人像写真' if len(faces)<3 else '集体照'
+                closed=0
+                for (fx,fy,fw,fh) in faces[:3]:
+                    e=eye.detectMultiScale(gray[fy:fy+fh//2,fx:fx+fw],1.05,4,minSize=(20,20))
+                    if len(e)<2: closed+=1
+                if closed>0:
+                    r['issues'].append({'t':'闭眼','c':round(closed/min(len(faces),3)*100,1),
+                                        'd':f"{closed}/{min(len(faces),3)}"})
+            else:
+                from ai_detector import SceneClassifier
+                r['scene'] = SceneClassifier().classify(rgb,0) if not self.ai else '其他场景'
 
-        # 5. pHash
+        # pHash
         try:
-            small = cv2.resize(gray, (128, 128))
-            r['phash'] = self.compute_phash(small)
-        except Exception:
-            r['phash'] = None
+            s = cv2.resize(gray,(128,128)); r['phash']=self.compute_phash(s)
+        except: r['phash']=None
 
         return r
 
@@ -282,237 +167,253 @@ class PhotoChecker:
 
 class App:
     def __init__(self, root):
-        self.root = root
-        self.root.title("照片废片检测工具 v4.0 AI")
-        self.root.geometry("1150x780")
-        self.root.minsize(950, 620)
+        self.root = root; self.root.title("图片质量智能分析系统 v4.1")
+        self.root.geometry("1200x800"); self.root.minsize(1000,640)
+        self.cfg = Config(); self.checker = PhotoChecker(self.cfg)
+        self.results=[]; self.bad_photos=[]; self.dup_groups=[]; self.move_hist=[]
+        self.processing=False; self._stop=False; self._paused=False
+        self._paused_idx=0; self._paused_files=[]; self._paused_folder=''
+        self._paused_hm={}; self.has_dnd=self._chk_dnd()
+        self._build(); self._load_p(); self._bind_drop()
+        self.root.after(600,self._init_ai)
 
-        self.cfg = Config()
-        self.checker = PhotoChecker(self.cfg)
-        self.results = []
-        self.bad_photos = []
-        self.duplicate_groups = []
-        self.move_history = []
-        self.processing = False
-        self._stop_flag = False
-        self.has_dnd = self._check_dnd()
-
-        self._build_ui()
-        self._load_params()
-        self._bind_drop()
-
-        # 异步初始化 AI
-        self.root.after(500, self._init_ai)
-
-    def _check_dnd(self):
-        try:
-            import tkinterdnd2; return True
-        except ImportError:
-            return False
-
-    @staticmethod
-    def _model_dir():
-        base = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base, 'models')
+    def _chk_dnd(self):
+        try: import tkinterdnd2; return True
+        except: return False
 
     # ── UI ──
-    def _build_ui(self):
-        root = self.root
-        if HAS_BOOTSTRAP:
-            self.style = tkb.Style(theme=self.cfg.get('theme') or 'darkly')
+    def _build(self):
+        r=self.root
+        if HAS_TKB:
+            self.style=tkb.Style(theme='darkly')
         else:
-            self.style = ttk.Style()
-            try: self.style.theme_use('clam')
-            except: pass
+            self.style=ttk.Style(); self.style.theme_use('clam')
+            r.configure(bg='#1E1E1E')
+            self.style.configure('.',background='#1E1E1E',foreground='#D4D4D4',fieldbackground='#2D2D2D')
+            self.style.configure('TFrame',background='#1E1E1E')
+            self.style.configure('TLabel',background='#1E1E1E',foreground='#D4D4D4')
+            self.style.configure('TLabelframe',background='#1E1E1E',foreground='#D4D4D4')
+            self.style.configure('Treeview',background='#252526',foreground='#D4D4D4',fieldbackground='#252526')
+            self.style.map('Treeview',background=[('selected','#094771')])
+            self.style.configure('TButton',background='#3C3C3C',foreground='#D4D4D4')
+            self.style.configure('TProgressbar',background='#165DFF')
 
         # 工具栏
-        tb = ttk.Frame(root)
-        tb.pack(fill='x', padx=10, pady=(8, 0))
+        tb=ttk.Frame(r); tb.pack(fill='x',padx=8,pady=(6,0))
+        ttk.Label(tb,text="文件夹:").pack(side='left')
+        self.fv=tk.StringVar(value=self.cfg.g('last_folder'))
+        ttk.Entry(tb,textvariable=self.fv,width=42).pack(side='left',padx=6,fill='x',expand=True)
+        ttk.Button(tb,text="选择",command=self._browse).pack(side='left')
+        self.bs=ttk.Button(tb,text="▶ 扫描",command=self._start)
+        self.bs.pack(side='left',padx=(8,0))
+        self.bpz=ttk.Button(tb,text="⏸ 暂停",command=self._pause_scan,state='disabled')
+        self.bpz.pack(side='left',padx=4)
+        self.bre=ttk.Button(tb,text="⏵ 继续",command=self._resume_scan,state='disabled')
+        self.bre.pack(side='left',padx=4)
+        self.bx=ttk.Button(tb,text="■ 停止",command=self._stop_scan,state='disabled')
+        self.bx.pack(side='left',padx=4)
+        ttk.Button(tb,text="移走废片",command=self._move).pack(side='left',padx=4)
+        ttk.Button(tb,text="撤销",command=self._undo).pack(side='left',padx=4)
+        ttk.Button(tb,text="导出CSV",command=self._csv).pack(side='left',padx=4)
+        self.bp=ttk.Button(tb,text="⚙ 参数",command=self._tp)
+        self.bp.pack(side='right',padx=4)
 
-        ttk.Label(tb, text="文件夹:").pack(side='left')
-        self.folder_var = tk.StringVar(value=self.cfg.get('last_folder'))
-        ttk.Entry(tb, textvariable=self.folder_var, width=45).pack(side='left', padx=6, fill='x', expand=True)
-        ttk.Button(tb, text="选择", command=self._browse).pack(side='left', padx=2)
-        self.btn_scan = ttk.Button(tb, text="扫描", command=self._start)
-        self.btn_scan.pack(side='left', padx=(8, 0))
-        self.btn_stop = ttk.Button(tb, text="停止", command=self._stop, state='disabled')
-        self.btn_stop.pack(side='left', padx=4)
-        ttk.Button(tb, text="移走废片", command=self._move_bad).pack(side='left', padx=4)
-        ttk.Button(tb, text="撤销", command=self._undo).pack(side='left', padx=4)
-        ttk.Button(tb, text="导出CSV", command=self._export_csv).pack(side='left', padx=4)
-        self.btn_params = ttk.Button(tb, text="⚙ 参数", command=self._toggle_params)
-        self.btn_params.pack(side='right', padx=4)
-
-        # 参数面板
-        self.params_visible = tk.BooleanVar(value=False)
-        self.params_frame = ttk.LabelFrame(root, text="检测参数", padding=8)
-
-        # AI 总开关
-        ai_row = ttk.Frame(self.params_frame)
-        ai_row.grid(row=0, column=0, columnspan=3, sticky='ew', pady=(0, 4))
-        self.ai_var = tk.BooleanVar(value=self.cfg.get_bool('enable_ai'))
-        ttk.Checkbutton(ai_row, text="启用 AI 增强检测 (UltraLight + 美学评分 + 模糊分类)",
+        # 参数面板（折叠）
+        self.pv=tk.BooleanVar(value=False)
+        self.pf=ttk.LabelFrame(r,text="检测参数",padding=8)
+        ai_row=ttk.Frame(self.pf); ai_row.grid(row=0,column=0,columnspan=3,sticky='ew')
+        self.ai_var=tk.BooleanVar(value=self.cfg.gb('enable_ai'))
+        ttk.Checkbutton(ai_row,text="🤖 AI智能分析 (SCRFD人脸 + 多维评分 + 场景分类)",
                         variable=self.ai_var,
-                        command=lambda: self.cfg.set('enable_ai', '1' if self.ai_var.get() else '0')
-                        ).pack(side='left')
-        ttk.Label(ai_row, text="(需 onnxruntime, 首次运行下载1.3MB模型)",
-                  font=('微软雅黑', 8), foreground='#888').pack(side='left', padx=12)
+                        command=self._on_ai_toggle).pack(side='left')
 
-        params_def = [
-            ("模糊阈值", "blur_threshold", 20, 300, 5),
-            ("过曝判定%", "overexposure_pct", 30, 100, 5),
-            ("欠曝判定%", "underexposure_pct", 5, 50, 1),
-            ("过亮值", "over_brightness", 200, 255, 5),
-            ("过暗值", "under_brightness", 5, 80, 5),
-            ("重复相似度%", "duplicate_threshold", 80, 100, 1),
-            ("美学最低分", "aesthetic_min", 1.0, 9.0, 0.5),
-        ]
-        self.sliders = {}
-        for i, (label, key, lo, hi, step) in enumerate(params_def):
-            col, row = i % 3, (i // 3) + 1
-            f = ttk.Frame(self.params_frame)
-            f.grid(row=row, column=col, padx=10, pady=4, sticky='ew')
-            ttk.Label(f, text=label, font=('微软雅黑', 9)).pack(anchor='w')
-            is_float = isinstance(lo, float)
-            if is_float:
-                sv = tk.DoubleVar(value=self.cfg.get_float(key))
-            else:
-                sv = tk.IntVar(value=self.cfg.get_int(key))
-            s = ttk.Scale(f, from_=lo, to=hi, variable=sv)
+        pd=[("模糊阈值","blur_threshold",20,300,5),("过曝判定%","overexposure_pct",30,100,5),
+            ("欠曝判定%","underexposure_pct",5,50,1),("过亮值","over_brightness",200,255,5),
+            ("过暗值","under_brightness",5,80,5),("重复相似度%","duplicate_threshold",80,100,1),
+            ("美学最低分","aesthetic_min",1.0,9.0,0.5)]
+        self.sls={}
+        for i,(lb,k,lo,hi,st) in enumerate(pd):
+            c,r2=i%3,i//3+1; f=ttk.Frame(self.pf); f.grid(row=r2,column=c,padx=10,pady=4,sticky='ew')
+            ttk.Label(f,text=lb,font=('微软雅黑',9)).pack(anchor='w')
+            # min/max + 当前值
+            vf=ttk.Frame(f); vf.pack(fill='x')
+            ttk.Label(vf,text=str(lo),font=('微软雅黑',7),foreground='#888').pack(side='left')
+            fl=isinstance(lo,float); sv=tk.DoubleVar(value=self.cfg.gf(k)) if fl else tk.IntVar(value=self.cfg.gi(k))
+            val_lbl=ttk.Label(vf,text="",font=('微软雅黑',8,'bold'),foreground='#ff9500',width=7)
+            val_lbl.pack(side='right')
+            ttk.Label(vf,text=str(hi),font=('微软雅黑',7),foreground='#888').pack(side='right')
+            def _update_val(v, lbl=val_lbl, fl=fl):
+                lbl.config(text=f"{float(v):.1f}" if fl else f"{int(float(v))}")
+            sv.trace_add('write', lambda *a, sv=sv, lbl=val_lbl, fl=fl:
+                         lbl.config(text=f"{float(sv.get()):.1f}" if fl else f"{int(sv.get())}"))
+            s=ttk.Scale(f,from_=lo,to=hi,variable=sv)
             s.pack(fill='x')
-            self.sliders[key] = (sv, s, is_float)
+            self.sls[k]=(sv,fl)
+            _update_val(sv.get())
+        bf=ttk.Frame(self.pf); bf.grid(row=99,column=0,columnspan=3,pady=(8,0),sticky='w')
+        ttk.Button(bf,text="恢复默认",command=self._rp).pack(side='left')
+        ttk.Button(bf,text="保存参数",command=self._sp).pack(side='left',padx=8)
+        for i in range(3): self.pf.columnconfigure(i,weight=1)
 
-        bf = ttk.Frame(self.params_frame)
-        bf.grid(row=99, column=0, columnspan=3, pady=(8, 0), sticky='w')
-        ttk.Button(bf, text="恢复默认", command=self._reset_params).pack(side='left')
-        ttk.Button(bf, text="保存参数", command=self._save_params).pack(side='left', padx=8)
-
-        for i in range(3):
-            self.params_frame.columnconfigure(i, weight=1)
-
-        # 统计
-        sf = ttk.Frame(root)
-        sf.pack(fill='x', padx=10, pady=(6, 0))
-        self.lbl_stats = ttk.Label(sf, text="就绪", font=('微软雅黑', 10))
+        # 统计栏
+        sf=ttk.Frame(r); sf.pack(fill='x',padx=8,pady=(6,0))
+        self.lbl_stats=ttk.Label(sf,text="就绪",font=('微软雅黑',10))
         self.lbl_stats.pack(side='left')
-        self.lbl_ai_status = ttk.Label(sf, text="AI: 加载中...", foreground='#888')
-        self.lbl_ai_status.pack(side='right')
+        self.lbl_ai=ttk.Label(sf,text="AI: 初始化中...",foreground='#888')
+        self.lbl_ai.pack(side='right')
 
-        # 进度
-        self.progress = ttk.Progressbar(root, mode='determinate')
-        self.progress.pack(fill='x', padx=10, pady=2)
-        self.lbl_progress = ttk.Label(root, text="")
-        self.lbl_progress.pack(anchor='w', padx=14)
+        # 进度条
+        self.pb=ttk.Progressbar(r,mode='determinate'); self.pb.pack(fill='x',padx=8,pady=2)
+        self.lbl_pb=ttk.Label(r,text=""); self.lbl_pb.pack(anchor='w',padx=12)
 
-        # 主内容
-        main = ttk.PanedWindow(root, orient='horizontal')
-        main.pack(fill='both', expand=True, padx=10, pady=(4, 10))
+        # 主区域
+        main=ttk.PanedWindow(r,orient='horizontal')
+        main.pack(fill='both',expand=True,padx=8,pady=(4,8))
 
-        # 表格
-        tf = ttk.Frame(main)
-        main.add(tf, weight=3)
-        cols = ("filename", "issue", "conf", "detail", "aesthetic", "face")
-        self.tree = ttk.Treeview(tf, columns=cols, show='headings', selectmode='browse')
-        self.tree.heading("filename", text="文件名")
-        self.tree.heading("issue", text="问题")
-        self.tree.heading("conf", text="置信度")
-        self.tree.heading("detail", text="详情")
-        self.tree.heading("aesthetic", text="美学分")
-        self.tree.heading("face", text="人脸质量")
-        self.tree.column("filename", width=160, minwidth=100)
-        self.tree.column("issue", width=80, minwidth=60)
-        self.tree.column("conf", width=60, minwidth=50)
-        self.tree.column("detail", width=180, minwidth=100)
-        self.tree.column("aesthetic", width=60, minwidth=50)
-        self.tree.column("face", width=70, minwidth=50)
-
-        ts = ttk.Scrollbar(tf, orient='vertical', command=self.tree.yview)
+        # 结果表格
+        tf=ttk.Frame(main); main.add(tf,weight=3)
+        cols=("fn","issue","conf","detail","score","scene")
+        self.tree=ttk.Treeview(tf,columns=cols,show='headings',selectmode='browse')
+        self.tree.heading("fn",text="文件名"); self.tree.heading("issue",text="问题")
+        self.tree.heading("conf",text="置信度"); self.tree.heading("detail",text="详情")
+        self.tree.heading("score",text="综合分"); self.tree.heading("scene",text="场景")
+        self.tree.column("fn",width=150,minwidth=100); self.tree.column("issue",width=80,minwidth=60)
+        self.tree.column("conf",width=80,minwidth=60); self.tree.column("detail",width=200,minwidth=120)
+        self.tree.column("score",width=65,minwidth=50); self.tree.column("scene",width=80,minwidth=60)
+        ts=ttk.Scrollbar(tf,orient='vertical',command=self.tree.yview)
         self.tree.configure(yscrollcommand=ts.set)
-        self.tree.pack(side='left', fill='both', expand=True)
-        ts.pack(side='right', fill='y')
-        self.tree.bind('<<TreeviewSelect>>', self._preview)
+        self.tree.pack(side='left',fill='both',expand=True); ts.pack(side='right',fill='y')
+        self.tree.bind('<Double-1>',self._report)
+        self.tree.bind('<<TreeviewSelect>>',self._preview)
 
         # 右侧面板
-        rf = ttk.Frame(main)
-        main.add(rf, weight=1)
+        rf=ttk.Frame(main); main.add(rf,weight=1)
+        plf=ttk.LabelFrame(rf,text="图片预览",padding=2)
+        plf.pack(fill='both',expand=True)
+        self.preview_frame = tk.Frame(plf, bg='#000000')
+        self.preview_frame.pack(fill='both', expand=True)
 
-        plf = ttk.LabelFrame(rf, text="图片预览", padding=4)
-        plf.pack(fill='both', expand=True)
-        self.lbl_preview = ttk.Label(plf, text="点击列表项预览", anchor='center')
-        self.lbl_preview.pack(fill='both', expand=True)
+        # 预览层
+        self.prev_view = tk.Frame(self.preview_frame, bg='#000000')
+        self.prev_view.pack(fill='both', expand=True)
+        self.lbl_preview = tk.Label(self.prev_view, text="双击查看分析报告\n单击预览图片",
+                                     bg='#000000', fg='#666', font=('微软雅黑', 11))
+        self.lbl_preview.pack(expand=True)
+        self._preview_img = None
 
-        dlf = ttk.LabelFrame(rf, text="重复照片组", padding=4)
-        dlf.pack(fill='x', pady=(4, 0))
-        self.tree_dup = ttk.Treeview(dlf, columns=("files",), show='headings', height=4)
-        self.tree_dup.heading("files", text="相似组")
-        self.tree_dup.column("files", width=100)
-        self.tree_dup.pack(fill='x')
+        # 报告层（初始隐藏）
+        self.rep_view = tk.Frame(self.preview_frame, bg='#1E1E1E')
+        self._showing_report = False
 
-        self.status = ttk.Label(root, text="v4.0 AI | UltraLight + NIMA-style | 纯离线",
-                                relief='sunken', font=('微软雅黑', 8))
-        self.status.pack(side='bottom', fill='x')
+        self.lbl_exif=ttk.Label(rf,text="",font=('微软雅黑',8),foreground='#888')
+        self.lbl_exif.pack(fill='x',pady=(2,0))
 
-        self.drop_label = ttk.Label(root, text="💡 支持拖拽文件夹 · Ctrl+O 选择",
-                                    foreground='#666')
-        self.drop_label.pack(side='bottom', pady=2)
+        dlf=ttk.LabelFrame(rf,text="重复照片组",padding=2)
+        dlf.pack(fill='x',pady=(4,0))
+        self.tdup=ttk.Treeview(dlf,columns=("f",),show='headings',height=3)
+        self.tdup.heading("f",text="相似组"); self.tdup.column("f",width=100)
+        self.tdup.pack(fill='x')
+
+        self.st=ttk.Label(r,text="v4.1 | SCRFD 2.5GF | 多维质量分析 | AI仅供参考",relief='sunken',
+                          font=('微软雅黑',8)); self.st.pack(side='bottom',fill='x')
 
     # ── AI 初始化 ──
     def _init_ai(self):
-        self.lbl_ai_status.config(text="AI: 检查模型...")
-        self.root.update_idletasks()
-        self.checker.init_ai(progress_cb=lambda msg: self.root.after(0,
-            lambda m=msg: self._ai_progress(m)))
+        self.lbl_ai.config(text="AI: 初始化..."); self.root.update_idletasks()
+        self.checker.init_ai(cb=lambda m: self.root.after(0,lambda msg=m:self._aip(msg)))
         if self.checker.ai and self.checker.ai.face_detector:
-            self.lbl_ai_status.config(text="AI: UltraLight ✓ | 美学评分 ✓ | 模糊分类 ✓",
-                                      foreground='#4cd964')
+            self.lbl_ai.config(text="AI: SCRFD ✓ | 多维评分 ✓ | 场景分类 ✓",foreground='#4cd964')
         else:
-            self.lbl_ai_status.config(text="AI: 传统模式 (安装 onnxruntime 启用AI)",
-                                      foreground='#888')
+            self.lbl_ai.config(text="AI: 标准模式 (pip install onnxruntime 启用AI)",foreground='#888')
 
-    def _ai_progress(self, msg):
-        self.lbl_ai_status.config(text=f"AI: {msg}")
-        self.root.update_idletasks()
+    def _aip(self,msg): self.lbl_ai.config(text=f"AI: {msg}"); self.root.update_idletasks()
 
-    # ── 参数 ──
-    def _toggle_params(self):
-        if self.params_visible.get():
-            self.params_frame.pack_forget()
-            self.params_visible.set(False)
+    def _show_ai_mode_dialog(self):
+        if self.cfg.g('ai_mode'): return
+        dlg=tk.Toplevel(self.root); dlg.title("选择AI运行模式"); dlg.geometry("560x520")
+        dlg.configure(bg='#1E1E1E'); dlg.transient(self.root); dlg.grab_set(); dlg.resizable(False,False)
+        tk.Label(dlg,text="选择AI运行模式",font=('微软雅黑',16,'bold'),fg='#D4D4D4',bg='#1E1E1E').pack(pady=(16,8))
+        lf=tk.LabelFrame(dlg,text="",bg='#252526'); lf.pack(fill='x',padx=16,pady=6)
+        tk.Label(lf,text="🟢 本地运行模式（推荐·隐私优先）",font=('微软雅黑',13,'bold'),fg='#4cd964',bg='#252526').pack(anchor='w',padx=10,pady=(8,0))
+        for t in ["✅ 100%离线，照片永不上传","✅ 准确率85-90%，免费使用","💻 8G内存即可，CPU运行","💰 永久免费"]:
+            tk.Label(lf,text=t,font=('微软雅黑',10),fg='#aaa',bg='#252526').pack(anchor='w',padx=24)
+        of=tk.LabelFrame(dlg,text="",bg='#252526'); of.pack(fill='x',padx=16,pady=6)
+        tk.Label(of,text="🔴 在线API模式（效果优先）",font=('微软雅黑',13,'bold'),fg='#ff6b35',bg='#252526').pack(anchor='w',padx=10,pady=(8,0))
+        for t in ["✅ 准确率95%+，审美评分更专业","⚠️ 照片需上传至第三方服务器","💻 只需联网，无硬件要求","💰 约0.05-0.1元/张"]:
+            tk.Label(of,text=t,font=('微软雅黑',10),fg='#aaa',bg='#252526').pack(anchor='w',padx=24)
+        tk.Label(dlg,text="⚠ 选择在线模式即同意将照片上传至AI服务商服务器\n所有AI分析结果仅供参考，请务必人工确认",
+                 font=('微软雅黑',9,'bold'),fg='#ff375f',bg='#1E1E1E',justify='center').pack(pady=8)
+        bf=tk.Frame(dlg,bg='#1E1E1E'); bf.pack(pady=(8,12))
+        tk.Button(bf,text="选择本地运行",font=('微软雅黑',11,'bold'),bg='#4cd964',fg='#fff',
+                  padx=20,pady=8,command=lambda: self._pick_ai_mode('local',dlg)).pack(side='left',padx=8)
+        tk.Button(bf,text="选择在线运行",font=('微软雅黑',11,'bold'),bg='#ff6b35',fg='#fff',
+                  padx=20,pady=8,command=lambda: self._pick_ai_mode('online',dlg)).pack(side='left',padx=8)
+
+    def _pick_ai_mode(self, mode, dlg):
+        self.cfg.s('ai_mode', mode); self.cfg.s('enable_ai','1'); self.ai_var.set(True)
+        dlg.destroy()
+        if mode=='online': self._show_api_config()
+        else: self._init_ai()
+
+    def _show_api_config(self):
+        dlg=tk.Toplevel(self.root); dlg.title("在线API配置"); dlg.geometry("480x340")
+        dlg.configure(bg='#1E1E1E'); dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg,text="配置在线API",font=('微软雅黑',14,'bold'),fg='#D4D4D4',bg='#1E1E1E').pack(pady=12)
+        tk.Label(dlg,text="API密钥（仅存本地）",font=('微软雅黑',10),fg='#888',bg='#1E1E1E').pack()
+        ak=tk.Entry(dlg,width=50,show='*',font=('微软雅黑',10)); ak.pack(pady=6)
+        ak.insert(0,self.cfg.g('api_key'))
+        tk.Label(dlg,text="API端点",font=('微软雅黑',10),fg='#888',bg='#1E1E1E').pack()
+        ep=tk.Entry(dlg,width=50,font=('微软雅黑',10)); ep.pack(pady=6)
+        ep.insert(0,self.cfg.g('api_endpoint') or 'https://api.openai.com/v1/chat/completions')
+        tk.Label(dlg,text="模型名",font=('微软雅黑',10),fg='#888',bg='#1E1E1E').pack()
+        mn=tk.Entry(dlg,width=50,font=('微软雅黑',10)); mn.pack(pady=6)
+        mn.insert(0,self.cfg.g('api_model') or 'gpt-4o')
+        def save(): self.cfg.s('api_key',ak.get()); self.cfg.s('api_endpoint',ep.get()); self.cfg.s('api_model',mn.get()); dlg.destroy()
+        tk.Button(dlg,text="保存配置",font=('微软雅黑',11,'bold'),bg='#165DFF',fg='#fff',padx=24,pady=6,command=save).pack(pady=12)
+        tk.Label(dlg,text="💡 支持OpenAI/通义千问/文心一言等兼容API",font=('微软雅黑',9),fg='#555',bg='#1E1E1E').pack()
+
+    def _on_ai_toggle(self):
+        """AI开关点击"""
+        if self.ai_var.get():
+            if not self.cfg.g('ai_mode'):
+                self.root.after(100, self._show_ai_mode_dialog)
+            else:
+                self.cfg.s('enable_ai','1'); self._init_ai()
         else:
-            self.params_frame.pack(fill='x', padx=10, pady=(6, 0),
-                                   after=self.status.master.children['!frame2'])
-            self.params_visible.set(True)
+            self.cfg.s('enable_ai','0')
 
-    def _load_params(self):
-        for key, (sv, _, is_float) in self.sliders.items():
-            try:
-                val = self.cfg.get_float(key) if is_float else self.cfg.get_int(key)
-                sv.set(val)
-            except Exception:
-                sv.set(float(Config.DEFAULTS.get(key, 0)))
+    # ── 参数面板 ──
+    def _tp(self):
+        if self.pv.get(): self.pf.pack_forget(); self.pv.set(False)
+        else: self.pf.pack(fill='x',padx=8,pady=(4,0),after=self.pb); self.pv.set(True)
 
-    def _reset_params(self):
-        for key, (sv, _, is_float) in self.sliders.items():
-            default = float(Config.DEFAULTS.get(key, 0))
-            if not is_float: default = int(default)
-            sv.set(default)
-        self._save_params()
+    def _load_p(self):
+        for k,(sv,fl) in self.sls.items():
+            try: sv.set(self.cfg.gf(k) if fl else self.cfg.gi(k))
+            except: sv.set(float(CONFIG_DEFAULTS.get(k,0)))
 
-    def _save_params(self):
-        for key, (sv, _, is_float) in self.sliders.items():
-            val = sv.get()
-            self.cfg.set(key, str(int(val)) if not is_float else f"{val:.1f}")
-        # AI 开关
-        self.cfg.set('enable_ai', '1' if self.ai_var.get() else '0')
+    def _rp(self):
+        for k,(sv,fl) in self.sls.items():
+            d=float(CONFIG_DEFAULTS.get(k,0))
+            if not fl: d=int(d); sv.set(d)
+            else: sv.set(d)
+        self._sp()
 
-        # 如果 AI 开关变了，重新初始化
-        if self.ai_var.get() and self.checker.ai is None:
-            self._init_ai()
-        elif not self.ai_var.get() and self.checker.ai:
-            self.checker.ai = None
-            self.lbl_ai_status.config(text="AI: 已关闭", foreground='#888')
+    def _sp(self):
+        for k,(sv,fl) in self.sls.items():
+            v=sv.get(); self.cfg.s(k,str(int(v)) if not fl else f"{v:.1f}")
+        self.cfg.s('enable_ai','1' if self.ai_var.get() else '0')
+        if self.ai_var.get() and self.checker.ai is None: self._init_ai()
+        elif not self.ai_var.get() and self.checker.ai: self.checker.ai=None; self.lbl_ai.config(text="AI: 已关闭",foreground='#888')
+        self._flash_saved()
 
-        messagebox.showinfo("保存", "参数已保存到 config.ini")
+    def _flash_saved(self):
+        """保存按钮旁边显示'已保存'"""
+        if not hasattr(self,'_saved_lbl'):
+            self._saved_lbl = ttk.Label(self.pf, text="", foreground='#4cd964', font=('微软雅黑',9))
+            self._saved_lbl.grid(row=99, column=1, padx=(12,0), sticky='w')
+        self._saved_lbl.config(text="✓ 已保存")
+        self.root.after(2000, lambda: self._saved_lbl.config(text=""))
 
     # ── 拖拽 ──
     def _bind_drop(self):
@@ -520,200 +421,275 @@ class App:
             try:
                 from tkinterdnd2 import DND_FILES
                 self.root.drop_target_register(DND_FILES)
-                self.root.dnd_bind('<<Drop>>', self._on_drop)
-            except Exception:
-                pass
-        self.root.bind('<Control-o>', lambda e: self._browse())
+                self.root.dnd_bind('<<Drop>>',self._on_drop)
+            except: pass
+        self.root.bind('<Control-o>',lambda e:self._browse())
 
-    def _on_drop(self, event):
-        path = event.data.strip('{}').strip()
-        if os.path.isdir(path):
-            self.folder_var.set(path)
-            self.cfg.set('last_folder', path)
+    def _on_drop(self,e):
+        p=e.data.strip('{}').strip()
+        if os.path.isdir(p): self.fv.set(p); self.cfg.s('last_folder',p)
 
-    # ── 操作 ──
     def _browse(self):
-        path = filedialog.askdirectory(title="选择照片文件夹")
-        if path:
-            self.folder_var.set(path)
-            self.cfg.set('last_folder', path)
+        p=filedialog.askdirectory(title="选择照片文件夹")
+        if p: self.fv.set(p); self.cfg.s('last_folder',p)
 
+    # ── 扫描 ──
     def _start(self):
-        folder = self.folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("提示", "请先选择照片文件夹")
-            return
+        f=self.fv.get().strip()
+        if not f or not os.path.isdir(f): messagebox.showwarning("提示","请先选择文件夹"); return
+        exts={'.jpg','.jpeg','.png','.bmp','.webp','.tiff','.tif'}
+        fls=[fn for fn in sorted(os.listdir(f)) if Path(fn).suffix.lower() in exts]
+        if not fls: messagebox.showinfo("提示","无图片"); return
 
-        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
-        files = [f for f in sorted(os.listdir(folder)) if Path(f).suffix.lower() in exts]
-        if not files:
-            messagebox.showinfo("提示", "该文件夹中没有图片文件")
-            return
+        self.tree.delete(*self.tree.get_children()); self.tdup.delete(*self.tdup.get_children())
+        self.results.clear(); self.bad_photos.clear(); self.dup_groups.clear()
+        self.pb['value']=0; self.pb['maximum']=len(fls); self.processing=True
+        self._stop=False; self._paused=False; self._paused_idx=0
+        self._paused_files=fls; self._paused_folder=f; self._paused_hm={}
+        self.bs.config(state='disabled'); self.bx.config(state='normal')
+        self.bpz.config(state='normal'); self.bre.config(state='disabled')
+        self.lbl_pb.config(text="扫描中...")
+        self._proc_thread=threading.Thread(target=self._proc,args=(f,fls,0,{}),daemon=True)
+        self._proc_thread.start()
 
-        self.tree.delete(*self.tree.get_children())
-        self.tree_dup.delete(*self.tree_dup.get_children())
-        self.results.clear(); self.bad_photos.clear()
-        self.duplicate_groups.clear()
-        self.progress['value'] = 0; self.progress['maximum'] = len(files)
-        self.processing = True
-        self._stop_flag = False
+    def _pause_scan(self):
+        self._paused=True; self.bpz.config(state='disabled'); self.bre.config(state='normal')
+        self.lbl_pb.config(text="已暂停 — 点击继续")
 
-        self.btn_scan.config(state='disabled')
-        self.btn_stop.config(state='normal')
-        self.lbl_progress.config(text="扫描中...")
+    def _resume_scan(self):
+        self._paused=False; self.bpz.config(state='normal'); self.bre.config(state='disabled')
+        self.lbl_pb.config(text="扫描中...")
+        self._proc_thread=threading.Thread(
+            target=self._proc,args=(self._paused_folder,self._paused_files,
+                                     self._paused_idx,self._paused_hm),daemon=True)
+        self._proc_thread.start()
 
-        threading.Thread(target=self._process, args=(folder, files), daemon=True).start()
+    def _stop_scan(self):
+        self._stop=True; self._paused=False
+        self.lbl_pb.config(text="正在停止...")
 
-    def _stop(self):
-        self._stop_flag = True
-        self.lbl_progress.config(text="正在停止...")
-
-    def _process(self, folder, files):
-        total = len(files)
-        hash_map = {}
-
-        for idx, fname in enumerate(files):
-            if self._stop_flag:
-                break
-            fp = os.path.join(folder, fname)
-            r = self.checker.check_single(fp)
+    def _proc(self,folder,files,start_idx,hm):
+        total=len(files)
+        for idx in range(start_idx, len(files)):
+            if self._stop: break
+            while self._paused and not self._stop:
+                self._paused_idx=idx; self._paused_hm=hm
+                import time; time.sleep(0.1)
+            if self._stop: break
+            fn=files[idx]; fp=os.path.join(folder,fn)
+            r=self.checker.check_single(fp)
             self.results.append(r)
+            if r['issues']: self.bad_photos.append(r)
+            for iss in r['issues']:
+                self.root.after(0,lambda fnm=fn,t=iss['t'],c=iss['c'],d=iss.get('d',''),
+                                sc=r['overall'],sn=r.get('scene',''):
+                    self.tree.insert('','end',values=(fnm,t,f"{c}%",d,
+                        f"{sc:.0f}" if sc>0 else '-',sn or '-')))
+            ph=r.get('phash')
+            if ph: hm.setdefault(ph,[]).append((idx,fn))
+            self.root.after(0,lambda i=idx+1,t=total: self._upd(i,t))
+        # 重复
+        if not self._paused and not self._stop:
+            th=self.cfg.gi('duplicate_threshold')
+            ks=list(hm.keys()); seen=set()
+            for i in range(len(ks)):
+                if i in seen: continue
+                g=[ks[i]]
+                for j in range(i+1,len(ks)):
+                    if j in seen: continue
+                    if PhotoChecker.hamming(ks[i],ks[j])<=(64-th*64/100):
+                        g.append(ks[j]); seen.add(j)
+                if len(g)>1:
+                    ns=[]; [ns.extend(fn for _,fn in hm[h]) for h in g]
+                    self.dup_groups.append(ns)
+                    self.root.after(0,lambda n=ns: self.tdup.insert('','end',values=(', '.join(n[:4]),)))
+        if not self._paused: self.root.after(0,self._done)
 
-            if r['issues']:
-                self.bad_photos.append(r)
-                for iss in r['issues']:
-                    self.root.after(0, lambda fn=fname, t=iss['type'], c=iss['conf'],
-                                    d=iss.get('detail', ''), aes=r['aesthetic'], fq=r['face_quality']:
-                        self.tree.insert('', 'end', values=(
-                            fn, t, f"{c}%", d, str(aes) if aes > 0 else '-',
-                            f"{fq:.0f}" if fq < 100 else '-')))
-
-            ph = r.get('phash')
-            if ph:
-                hash_map.setdefault(ph, []).append((idx, fname))
-
-            self.root.after(0, lambda i=idx+1, t=total: self._update_pb(i, t))
-
-        # 重复检测
-        threshold = self.cfg.get_int('duplicate_threshold')
-        hashes = list(hash_map.keys())
-        seen = set()
-        for i in range(len(hashes)):
-            if i in seen: continue
-            grp = [hashes[i]]
-            for j in range(i + 1, len(hashes)):
-                if j in seen: continue
-                dist = PhotoChecker.hamming_distance(hashes[i], hashes[j])
-                if dist <= (64 - threshold * 64 / 100):
-                    grp.append(hashes[j]); seen.add(j)
-            if len(grp) > 1:
-                names = []
-                for h in grp: names.extend(fn for _, fn in hash_map[h])
-                self.duplicate_groups.append(names)
-                self.root.after(0, lambda n=names: self.tree_dup.insert('', 'end', values=(', '.join(n[:4]),)))
-
-        self.root.after(0, self._on_done)
-
-    def _update_pb(self, cur, total):
-        self.progress['value'] = cur
-        self.lbl_progress.config(text=f"处理中：{cur}/{total} ({int(cur/total*100)}%)")
+    def _upd(self,cur,total):
+        self.pb['value']=cur
+        self.lbl_pb.config(text=f"处理中：{cur}/{total} ({int(cur/total*100)}%)")
         self.lbl_stats.config(text=f"废片：{len(self.bad_photos)}  |  总计：{total}")
 
-    def _on_done(self):
-        self.processing = False
-        self.btn_scan.config(state='normal')
-        self.btn_stop.config(state='disabled')
-        bad, dup, total = len(self.bad_photos), len(self.duplicate_groups), len(self.results)
-        stopped = "已停止 · " if self._stop_flag else ""
-        self.lbl_progress.config(text=stopped + "扫描完成！")
-        parts = [f"废片：{bad}"]
-        if dup: parts.append(f"重复组：{dup}")
-        parts.append(f"总计：{total}")
-        self.lbl_stats.config(text="  |  ".join(parts))
-        if dup: self.status.config(text=f"🔁 {dup} 组重复照片")
+    def _done(self):
+        self.processing=False
+        self.bs.config(state='normal'); self.bx.config(state='disabled')
+        self.bpz.config(state='disabled'); self.bre.config(state='disabled')
+        bad,dup,total=len(self.bad_photos),len(self.dup_groups),len(self.results)
+        stp="已停止 · " if self._stop else ""
+        self.lbl_pb.config(text=stp+"扫描完成！")
+        ps=[f"废片：{bad}"]
+        if dup: ps.append(f"重复组：{dup}")
+        ps.append(f"总计：{total}")
+        self.lbl_stats.config(text="  |  ".join(ps))
+        self.st.config(text=f"v4.1 | SCRFD 2.5GF | {total}张 | AI分析仅供参考，请人工确认")
 
-    def _preview(self, event):
-        sel = self.tree.selection()
+    # ── 预览 ──
+    def _preview(self,event):
+        if self._showing_report: return
+        sel=self.tree.selection()
         if not sel or not HAS_PIL: return
-        idx = self.tree.index(sel[0])
-        if idx >= len(self.results): return
-        fname = self.results[idx]['file']
-        fp = os.path.join(self.folder_var.get().strip(), fname)
+        idx=self.tree.index(sel[0])
+        if idx>=len(self.results): return
+        r=self.results[idx]; fp=os.path.join(self.fv.get().strip(),r['file'])
         if not os.path.exists(fp): return
         try:
-            img = Image.open(fp)
-            img.thumbnail((300, 300), Image.LANCZOS)
+            img=Image.open(fp); exif=self._exif(img)
+            img.thumbnail((350,350),Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
-            self.lbl_preview.config(image=photo, text='')
-            self.lbl_preview.image = photo
-        except Exception as e:
-            self.lbl_preview.config(image='', text=f"预览失败\n{e}")
+            self._preview_img = photo
+            self.lbl_preview.config(image=photo, text='', bg='#000000')
+            self.lbl_exif.config(text=exif)
+        except Exception:
+            self.lbl_preview.config(image='', text="预览失败", bg='#000000')
 
-    def _move_bad(self):
-        folder = self.folder_var.get().strip()
-        if not self.bad_photos:
-            messagebox.showinfo("提示", "没有需要移动的废片"); return
-        bad_folder = os.path.join(folder, "_废片")
-        os.makedirs(bad_folder, exist_ok=True)
-        moved, self.move_history = 0, []
+    def _exif(self,img):
+        try:
+            exif={ExifTags.TAGS[k]:v for k,v in img._getexif().items() if k in ExifTags.TAGS} if img._getexif() else {}
+            parts=[]
+            if 'Model' in exif: parts.append(exif['Model'])
+            if 'ISOSpeedRatings' in exif: parts.append(f"ISO{exif['ISOSpeedRatings']}")
+            if 'FNumber' in exif: parts.append(f"f/{float(exif['FNumber']):.1f}")
+            if 'ExposureTime' in exif: parts.append(f"{exif['ExposureTime']}s")
+            if 'FocalLength' in exif: parts.append(f"{float(exif['FocalLength']):.0f}mm")
+            return ' | '.join(parts) if parts else ''
+        except: return ''
+
+    # ── 分析报告（嵌入式切换）──
+    def _report(self,event):
+        sel=self.tree.selection()
+        if not sel: return
+        idx=self.tree.index(sel[0])
+        if idx>=len(self.results): return
+        r=self.results[idx]
+
+        # 切换到报告层
+        self.prev_view.pack_forget()
+        for w in self.rep_view.winfo_children(): w.destroy()
+        self.rep_view.pack(fill='both', expand=True)
+        self._showing_report = True
+
+        cf=tk.Frame(self.rep_view,bg='#1E1E1E'); cf.pack(fill='both',expand=True)
+        cv=tk.Canvas(cf,bg='#1E1E1E',highlightthickness=0)
+        sb=tk.Scrollbar(cf,orient='vertical',command=cv.yview)
+        inner=tk.Frame(cv,bg='#1E1E1E')
+        inner.bind('<Configure>',lambda e:cv.configure(scrollregion=cv.bbox('all')))
+
+        # 动态宽度：跟随容器
+        def _set_width(e=None):
+            w = cf.winfo_width() - 20 if cf.winfo_width() > 100 else 400
+            cv.itemconfig(cv.find_all()[0], width=w) if cv.find_all() else None
+        cf.bind('<Configure>', _set_width)
+        cv.create_window((0,0),window=inner,anchor='nw',width=400,tags=('inner',))
+        cv.configure(yscrollcommand=sb.set)
+        cv.pack(side='left',fill='both',expand=True); sb.pack(side='right',fill='y')
+
+        # 文件名做截断
+        fname = r['file'][:40]+'...' if len(r['file'])>40 else r['file']
+        tk.Label(inner,text=f"\U0001f4cb {fname}",font=('微软雅黑',13,'bold'),fg='#D4D4D4',bg='#1E1E1E',
+                 wraplength=380).pack(anchor='w',padx=12,pady=(12,0))
+
+        ov=r.get('overall',0); gd=r.get('grade','-')
+        gc='#4cd964' if ov>=90 else '#ff9500' if ov>=75 else '#ff6b35' if ov>=60 else '#ff375f'
+        tk.Label(inner,text=f"综合评分：{ov:.0f}/100  {gd}",font=('微软雅黑',22,'bold'),fg=gc,bg='#1E1E1E').pack(anchor='w',padx=12,pady=8)
+
+        tk.Label(inner,text=f"\U0001f3f7️ {r.get('scene','-')}  |  \U0001f464 {r.get('face_count',0)}人",
+                 font=('微软雅黑',11),fg='#888',bg='#1E1E1E').pack(anchor='w',padx=12,pady=2)
+
+        q=r.get('quality',{})
+        if q:
+            lf=tk.LabelFrame(inner,text=" 质量维度 ",fg='#D4D4D4',bg='#1E1E1E',font=('微软雅黑',11)); lf.pack(fill='x',padx=10,pady=8)
+            for k,lab in [('tech','\U0001f4ca 技术质量'),('composition','\U0001f5bc️ 构图'),('portrait','\U0001f464 人像')]:
+                d=q.get(k,{})
+                if d and d.get('overall',0)>0:
+                    tk.Label(lf,text=f"{lab}：{d['overall']:.0f}/100",fg='#D4D4D4',bg='#1E1E1E',
+                             font=('微软雅黑',11)).pack(anchor='w',padx=10,pady=2)
+            tk.Label(lf,text=f"\U0001f3a8 美学评分：{r.get('aesthetic',0):.1f}/10",fg='#ff9500',bg='#1E1E1E',
+                     font=('微软雅黑',12,'bold')).pack(anchor='w',padx=10,pady=3)
+
+        if r['issues']:
+            il=tk.LabelFrame(inner,text=" ⚠️ 问题 ",fg='#ff6b35',bg='#1E1E1E',font=('微软雅黑',11)); il.pack(fill='x',padx=10,pady=8)
+            for iss in r['issues']:
+                tk.Label(il,text=f"⚠ {iss['t']} ({iss['c']}%) — {iss.get('d','')}",fg='#ff6b35',bg='#1E1E1E',
+                         font=('微软雅黑',10),wraplength=380).pack(anchor='w',padx=10,pady=2)
+
+        sug=r.get('suggestions',[])
+        if sug:
+            sl=tk.LabelFrame(inner,text=" \U0001f4a1 AI建议 ",fg='#4cd964',bg='#1E1E1E',font=('微软雅黑',11)); sl.pack(fill='x',padx=10,pady=8)
+            for s in sug:
+                tk.Label(sl,text=f"• {s}",fg='#D4D4D4',bg='#1E1E1E',wraplength=380,
+                         font=('微软雅黑',10),justify='left').pack(anchor='w',padx=10,pady=2)
+
+        tk.Label(inner,text="⚠ AI分析存在误差，请人工复核确认",fg='#555',bg='#1E1E1E',
+                 font=('微软雅黑',9)).pack(pady=(10,8))
+        tk.Button(inner,text="← 返回预览",font=('微软雅黑',10),bg='#3C3C3C',fg='#D4D4D4',
+                  padx=16,pady=4,command=self._show_preview).pack(anchor='w',padx=12,pady=(0,14))
+
+    def _show_preview(self):
+        self.rep_view.pack_forget()
+        self.prev_view.pack(fill='both', expand=True)
+        self._showing_report = False
+
+    # ── 操作 ──
+    def _move(self):
+        f=self.fv.get().strip()
+        if not self.bad_photos: messagebox.showinfo("提示","无废片"); return
+        bd=os.path.join(f,"_废片"); os.makedirs(bd,exist_ok=True)
+        moved,self.move_hist=0,[]
         for r in self.bad_photos:
-            src = os.path.join(folder, r['file'])
-            dst = os.path.join(bad_folder, r['file'])
+            src=os.path.join(f,r['file']); dst=os.path.join(bd,r['file'])
             try:
                 if os.path.exists(src):
-                    base, ext = os.path.splitext(r['file']); c = 1
-                    while os.path.exists(dst):
-                        dst = os.path.join(bad_folder, f"{base}_{c}{ext}"); c += 1
-                    shutil.move(src, dst)
-                    self.move_history.append((src, dst)); moved += 1
-            except Exception as e:
-                print(f"移动失败: {r['file']}: {e}")
-        messagebox.showinfo("完成", f"已移动 {moved} 张废片到：\n{bad_folder}")
-        self.status.config(text=f"已移动 {moved} 张 | {bad_folder}")
+                    b,e=os.path.splitext(r['file']); c=1
+                    while os.path.exists(dst): dst=os.path.join(bd,f"{b}_{c}{e}"); c+=1
+                    shutil.move(src,dst); self.move_hist.append((src,dst)); moved+=1
+            except: pass
+        self.st.config(text=f"✓ 已移动 {moved} 张到 _废片/")
+        self.root.after(3000, lambda: self.st.config(
+            text=f"v4.1 | SCRFD 2.5GF | {len(self.results)}张 | AI仅供参考"))
 
     def _undo(self):
-        if not self.move_history:
-            messagebox.showinfo("提示", "没有可撤销的移动操作"); return
-        restored = 0
-        for src, dst in self.move_history:
+        if not self.move_hist:
+            self.st.config(text="无可撤销操作")
+            self.root.after(2000, lambda: self.st.config(
+                text=f"v4.1 | SCRFD 2.5GF | {len(self.results)}张 | AI仅供参考"))
+            return
+        r=0
+        for s,d in self.move_hist:
             try:
-                if os.path.exists(dst): shutil.move(dst, src); restored += 1
-            except Exception as e:
-                print(f"撤销失败: {e}")
-        self.move_history.clear()
-        messagebox.showinfo("完成", f"已恢复 {restored} 张照片到原位置")
-        self.status.config(text=f"已撤销 {restored} 张")
+                if os.path.exists(d): shutil.move(d,s); r+=1
+            except: pass
+        self.move_hist.clear()
+        self.st.config(text=f"✓ 已恢复 {r} 张照片到原位置")
+        self.root.after(3000, lambda: self.st.config(
+            text=f"v4.1 | SCRFD 2.5GF | {len(self.results)}张 | AI仅供参考"))
 
-    def _export_csv(self):
-        if not self.results:
-            messagebox.showinfo("提示", "没有检测结果可导出"); return
-        folder = self.folder_var.get().strip()
-        name = f"检测报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path = filedialog.asksaveasfilename(initialdir=folder, initialfile=name,
-                                             defaultextension='.csv', filetypes=[("CSV", "*.csv")])
-        if not path: return
-        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-            w = csv.writer(f)
-            w.writerow(['文件名', '状态', '问题类型', '置信度', '详情', '美学分', '人脸质量分'])
+    def _csv(self):
+        if not self.results: messagebox.showinfo("提示","无结果"); return
+        f=self.fv.get().strip()
+        n=f"分析报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        p=filedialog.asksaveasfilename(initialdir=f,initialfile=n,defaultextension='.csv',
+                                        filetypes=[("CSV","*.csv")])
+        if not p: return
+        with open(p,'w',newline='',encoding='utf-8-sig') as fh:
+            w=csv.writer(fh)
+            w.writerow(['文件名','综合评分','等级','场景','美学分','问题类型','置信度','详情','AI建议'])
             for r in self.results:
-                aes = str(r.get('aesthetic', 0)) if r.get('aesthetic', 0) > 0 else ''
-                fq = f"{r.get('face_quality', 100):.0f}" if r.get('face_quality', 100) < 100 else ''
                 if r['issues']:
                     for iss in r['issues']:
-                        w.writerow([r['file'], '废片', iss['type'], f"{iss['conf']}%", iss.get('detail', ''), aes, fq])
+                        w.writerow([r['file'],f"{r.get('overall',0):.0f}",r.get('grade',''),
+                                    r.get('scene',''),r.get('aesthetic',0),
+                                    iss['t'],f"{iss['c']}%",iss.get('d',''),
+                                    '; '.join(r.get('suggestions',[]))])
                 else:
-                    w.writerow([r['file'], '正常', '', '', '', aes, fq])
-        messagebox.showinfo("导出完成", f"报告已保存到：\n{path}")
-
+                    w.writerow([r['file'],f"{r.get('overall',0):.0f}",r.get('grade',''),
+                                r.get('scene',''),r.get('aesthetic',0),'正常','','',
+                                '; '.join(r.get('suggestions',[]))])
+        messagebox.showinfo("导出",f"已保存：{p}")
 
 def main():
     try:
-        from tkinterdnd2 import TkinterDnD
-        root = TkinterDnD.Tk()
-    except ImportError:
-        root = tk.Tk()
-    App(root)
-    root.mainloop()
+        from tkinterdnd2 import TkinterDnD; root=TkinterDnD.Tk()
+    except: root=tk.Tk()
+    App(root); root.mainloop()
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

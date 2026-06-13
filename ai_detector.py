@@ -1,497 +1,448 @@
 """
-AI 检测模块 — ONNX Runtime 驱动，完全离线
-- UltraLight 人脸检测（1.3MB ONNX）
-- 人脸质量分析（眼睛/角度/光照）
-- NIMA 风格美学评分（启发式）
-- 模糊类型分类（失焦/运动模糊/背景虚化）
+AI 检测模块 v4.1 — SCRFD_2.5GF + 多维质量分析
+- SCRFD 人脸检测 + 5点关键点 → EAR闭眼
+- 场景自动分类（7类）
+- 多维度质量评分（综合/人像/技术/构图）
+- 美学评分（独立维度）
 """
 
-import os
-import hashlib
-import urllib.request
-import numpy as np
-import cv2
-import json
+import os, urllib.request, numpy as np, cv2
 
-# ── ONNX Runtime ──
 try:
     import onnxruntime as ort
-    # 抑制 ONNX 初始化警告
-    ort.set_default_logger_severity(3)  # ERROR only
+    ort.set_default_logger_severity(3)
     HAS_ONNX = True
 except ImportError:
     HAS_ONNX = False
 
-# ── 模型下载路径 ──
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
-ULTRALIGHT_URL = (
-    "https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/"
-    "raw/master/models/onnx/version-RFB-640.onnx"
-)
-ULTRALIGHT_MODEL = os.path.join(MODEL_DIR, 'ultraface_rfb_640.onnx')
-
+SCRFD_URL = "https://huggingface.co/public-data/insightface/resolve/main/models/scrfd_2.5g/scrfd_2.5g_bnkps.onnx"
+SCRFD_PATH = os.path.join(MODEL_DIR, 'scrfd_2.5g_bnkps.onnx')
 
 # ═══════════════════════════════════════════
-# 工具函数
+# 工具
 # ═══════════════════════════════════════════
-
-def ensure_model_downloaded(url, local_path, progress_callback=None):
-    """下载模型文件（如不存在）"""
-    if os.path.exists(local_path):
-        return True
-
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-    try:
-        if progress_callback:
-            progress_callback(f"下载模型: {os.path.basename(local_path)}...")
-
-        req = urllib.request.Request(url, headers={'User-Agent': 'photo-checker/3.0'})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = resp.read()
-        with open(local_path, 'wb') as f:
-            f.write(data)
-
-        if progress_callback:
-            progress_callback("模型下载完成 ✓")
-        return True
-    except Exception as e:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-        if progress_callback:
-            progress_callback(f"模型下载失败: {e}")
-        return False
-
 
 def _softmax(x):
     e = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return e / np.sum(e, axis=-1, keepdims=True)
 
-
-def _nms(boxes, scores, iou_threshold=0.4):
-    """非极大值抑制"""
-    if len(boxes) == 0:
-        return []
-    x1 = boxes[:, 0]; y1 = boxes[:, 1]
-    x2 = boxes[:, 2]; y2 = boxes[:, 3]
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
+def _nms(dets, thresh=0.45):
+    if len(dets) < 2: return list(range(len(dets)))
+    x1, y1 = dets[:, 0], dets[:, 1]
+    x2, y2 = dets[:, 2], dets[:, 3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = dets[:, 4].argsort()[::-1]
     keep = []
-    while order.size > 0:
+    while len(order) > 0:
         i = order[0]; keep.append(i)
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
-        w = np.maximum(0, xx2 - xx1)
-        h = np.maximum(0, yy2 - yy1)
-        inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
-        order = order[1:][iou <= iou_threshold]
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+        ovr = w * h / (areas[i] + areas[order[1:]] - w * h)
+        order = order[1:][ovr <= thresh]
     return keep
 
+def ensure_model(url, path, cb=None):
+    if os.path.exists(path): return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if cb: cb(f"下载 {os.path.basename(path)}...")
+        req = urllib.request.Request(url, headers={'User-Agent':'photo-checker/4.1'})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = r.read()
+        with open(path, 'wb') as f: f.write(data)
+        if cb: cb("下载完成")
+        return True
+    except Exception as e:
+        if os.path.exists(path): os.remove(path)
+        if cb: cb(f"下载失败: {e}")
+        return False
+
 
 # ═══════════════════════════════════════════
-# UltraLight 人脸检测
+# SCRFD 人脸检测
 # ═══════════════════════════════════════════
 
-class UltraLightFace:
-    """UltraLight ONNX 人脸检测器"""
+class SCRFD:
+    """SCRFD_2.5GF ONNX 人脸检测 + 5点关键点"""
 
-    INPUT_SIZE = (640, 640)       # 模型输入尺寸
-    MEAN = np.array([127, 127, 127], dtype=np.float32)
-    STD  = np.array([128, 128, 128], dtype=np.float32)
-    CONF_THRESHOLD = 0.6
-    IOU_THRESHOLD  = 0.4
-
-    # 锚点生成参数
-    _ANCHORS = None
+    INPUT_SIZE = (640, 640)
+    STRIDES = [8, 16, 32]
+    NUM_ANCHORS = 2
+    CENTER_CACHE = {}
 
     def __init__(self, model_path=None):
-        if not HAS_ONNX:
-            raise RuntimeError("onnxruntime 未安装，请 pip install onnxruntime")
-
-        if model_path is None:
-            model_path = ULTRALIGHT_MODEL
-
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"模型文件不存在: {model_path}")
-
-        self.session = ort.InferenceSession(model_path,
+        if not HAS_ONNX: raise RuntimeError("需要 onnxruntime")
+        self.session = ort.InferenceSession(model_path or SCRFD_PATH,
             providers=['CPUExecutionProvider'])
         self._input_name = self.session.get_inputs()[0].name
 
     @staticmethod
-    def _get_anchors():
-        """生成UltraLight特征金字塔锚点"""
-        if UltraLightFace._ANCHORS is not None:
-            return UltraLightFace._ANCHORS
+    def _distance2bbox(points, distance):
+        """解码bbox"""
+        x1 = points[:, 0] - distance[:, 0]
+        y1 = points[:, 1] - distance[:, 1]
+        x2 = points[:, 0] + distance[:, 2]
+        y2 = points[:, 1] + distance[:, 3]
+        return np.stack([x1, y1, x2, y2], axis=1)
 
-        anchors = []
-        min_boxes = [[10, 16, 24], [32, 48], [64, 96], [128, 192, 256]]
-        strides  = [8, 16, 32, 64]
+    @staticmethod
+    def _distance2kps(points, distance):
+        """解码关键点"""
+        kps = np.zeros((len(points), 10), dtype=np.float32)
+        for i in range(5):
+            kps[:, i*2]   = points[:, 0] + distance[:, i*2]
+            kps[:, i*2+1] = points[:, 1] + distance[:, i*2+1]
+        return kps
 
-        for step_idx, step in enumerate(strides):
-            fmap_size = 640 // step
-            for y in range(fmap_size):
-                for x in range(fmap_size):
-                    cx = (x + 0.5) * step / 640.0
-                    cy = (y + 0.5) * step / 640.0
-                    for ratio in min_boxes[step_idx]:
-                        s = ratio / 640.0
-                        anchors.append([cx, cy, s, s])
-        UltraLightFace._ANCHORS = np.array(anchors, dtype=np.float32)
-        return UltraLightFace._ANCHORS
-
-    def detect(self, img_rgb):
-        """
-        返回: [(x1, y1, x2, y2, confidence), ...]
-        """
-        h, w = img_rgb.shape[:2]
+    def detect(self, img_bgr, threshold=0.5):
+        h, w = img_bgr.shape[:2]
 
         # 预处理
-        resized = cv2.resize(img_rgb, self.INPUT_SIZE)
-        input_tensor = ((resized.astype(np.float32) - self.MEAN) / self.STD)
-        input_tensor = np.transpose(input_tensor, (2, 0, 1))[np.newaxis, ...]
+        im_ratio = float(h) / w
+        if im_ratio > 1.3:
+            new_h, new_w = 640, int(640 / im_ratio)
+        elif im_ratio < 0.7:
+            new_h, new_w = int(640 * im_ratio), 640
+        else:
+            new_h, new_w = 640, 640
+
+        resized = cv2.resize(img_bgr, (new_w, new_h))
+        det_scale = float(new_h) / h
+
+        # Pad to 640x640
+        input_img = np.zeros((640, 640, 3), dtype=np.float32)
+        input_img[:new_h, :new_w, :] = resized
+        input_img = (input_img - 127.5) / 128.0  # normalize to [-1, 1]
+        input_tensor = np.transpose(input_img, (2, 0, 1))[np.newaxis, ...].astype(np.float32)
 
         # 推理
         outputs = self.session.run(None, {self._input_name: input_tensor})
-        scores_raw = outputs[0]  # (1, N, 2)
-        boxes_raw  = outputs[1]  # (1, N, 4)
 
-        scores = _softmax(scores_raw[0])[:, 1]  # 正类confidence
-        boxes = boxes_raw[0]
+        # 解析多尺度输出
+        scores_list, bboxes_list, kpss_list = [], [], []
+        fmc = 3  # 3 feature map levels
+        for idx, stride in enumerate(self.STRIDES):
+            score = outputs[idx]        # (1, N, 1)
+            bbox  = outputs[idx + fmc]  # (1, N, 4)
+            kps   = outputs[idx + fmc*2]  # (1, N, 10)
 
-        # 过滤低置信度
-        mask = scores > self.CONF_THRESHOLD
-        scores = scores[mask]
-        boxes = boxes[mask]
+            score = score[0, :, 0]
+            bbox  = bbox[0]
+            kps   = kps[0]
 
-        if len(boxes) == 0:
+            # 生成锚点中心
+            feat_h, feat_w = 640 // stride, 640 // stride
+            key = (feat_h, feat_w, stride)
+            if key not in self.CENTER_CACHE:
+                yv, xv = np.meshgrid(np.arange(feat_h), np.arange(feat_w), indexing='ij')
+                centers = np.stack([xv, yv], axis=2).reshape(-1, 2) * stride
+                self.CENTER_CACHE[key] = centers.astype(np.float32)
+            centers = self.CENTER_CACHE[key]
+
+            bbox = bbox * stride
+            kps  = kps * stride
+
+            # 过滤
+            pos = score >= threshold
+            if pos.sum() > 0:
+                scores_list.append(score[pos])
+                bboxes_list.append(self._distance2bbox(centers[pos], bbox[pos]))
+                kpss_list.append(self._distance2kps(centers[pos], kps[pos]))
+
+        if not scores_list:
             return []
 
-        # 解码：锚点中心偏移 → 绝对坐标
-        anchors = self._get_anchors()
-        if len(anchors) > 0:
-            valid_anchors = anchors[mask]
-            cx = boxes[:, 0] * 0.1 * valid_anchors[:, 2] + valid_anchors[:, 0]
-            cy = boxes[:, 1] * 0.1 * valid_anchors[:, 3] + valid_anchors[:, 1]
-            bw = valid_anchors[:, 2] * np.exp(boxes[:, 2] * 0.2)
-            bh = valid_anchors[:, 3] * np.exp(boxes[:, 3] * 0.2)
-        else:
-            cx, cy = boxes[:, 0], boxes[:, 1]
-            bw, bh = boxes[:, 2], boxes[:, 3]
+        scores  = np.concatenate(scores_list)
+        bboxes  = np.concatenate(bboxes_list)
+        kpss    = np.concatenate(kpss_list)
 
-        x1 = (cx - bw / 2) * w
-        y1 = (cy - bh / 2) * h
-        x2 = (cx + bw / 2) * w
-        y2 = (cy + bh / 2) * h
+        # 缩放到原图
+        bboxes /= det_scale
+        kpss   /= det_scale
 
-        # 裁剪到图像范围
-        x1 = np.clip(x1, 0, w)
-        y1 = np.clip(y1, 0, h)
-        x2 = np.clip(x2, 0, w)
-        y2 = np.clip(y2, 0, h)
-
-        dets = np.stack([x1, y1, x2, y2, scores], axis=1)
+        # 裁剪
+        bboxes[:, 0] = np.clip(bboxes[:, 0], 0, w)
+        bboxes[:, 1] = np.clip(bboxes[:, 1], 0, h)
+        bboxes[:, 2] = np.clip(bboxes[:, 2], 0, w)
+        bboxes[:, 3] = np.clip(bboxes[:, 3], 0, h)
 
         # NMS
-        keep = _nms(dets[:, :4], dets[:, 4], self.IOU_THRESHOLD)
-        return [tuple(dets[i]) for i in keep]
+        dets = np.hstack([bboxes, scores[:, None]])
+        keep = _nms(dets, 0.45)
+
+        results = []
+        for i in keep:
+            x1, y1, x2, y2, s = dets[i]
+            results.append({
+                'box': (int(x1), int(y1), int(x2), int(y2)),
+                'score': round(float(s), 4),
+                'kps': kpss[i].reshape(5, 2).tolist()  # [leye, reye, nose, lmouth, rmouth]
+            })
+        return results
 
 
 # ═══════════════════════════════════════════
-# 人脸质量分析
+# 眼纵横比 (EAR)
 # ═══════════════════════════════════════════
 
-class FaceAnalyzer:
-    """人脸质量分析：眼睛张开度、头部角度、光照均匀度"""
+def eye_aspect_ratio(eye_pts):
+    """eye_pts: [(x,y),...] 6个点"""
+    if len(eye_pts) < 6:
+        # 简化：用4个角点估算
+        pts = np.array(eye_pts[:4])
+        if len(pts) < 4: return 0.3
+        v = np.linalg.norm(pts[1] - pts[3])
+        h = np.linalg.norm(pts[0] - pts[2])
+        return v / max(h, 0.001)
+    pts = np.array(eye_pts)
+    v1 = np.linalg.norm(pts[1] - pts[5])
+    v2 = np.linalg.norm(pts[2] - pts[4])
+    h  = np.linalg.norm(pts[0] - pts[3])
+    return (v1 + v2) / (2.0 * max(h, 0.001))
 
-    def __init__(self):
-        cascade = cv2.data.haarcascades
-        self.eye_cascade = cv2.CascadeClassifier(
-            os.path.join(cascade, 'haarcascade_eye.xml'))
 
-    def analyze(self, gray, face_box):
-        """
-        face_box: (x1, y1, x2, y2)
-        返回: {eye_open, head_angle, lighting_score, overall}
-        """
-        x1, y1, x2, y2 = [int(v) for v in face_box[:4]]
-        x1 = max(0, x1); y1 = max(0, y1)
-        x2 = min(gray.shape[1], x2); y2 = min(gray.shape[0], y2)
-        face_roi = gray[y1:y2, x1:x2]
-        fh, fw = face_roi.shape
+# ═══════════════════════════════════════════
+# 场景分类器
+# ═══════════════════════════════════════════
 
-        result = {
-            'eye_open': 100.0,
-            'head_angle': 0.0,
-            'lighting_score': 100.0,
-            'overall': 100.0
+class SceneClassifier:
+    """启发式场景分类：7类"""
+
+    LABELS = ['人像写真', '集体照', '风景风光', '美食探店', '室内空间', '商品拍摄', '其他场景']
+    ICONS  = {'人像写真':'🧑‍🤝‍🧑','集体照':'👥','风景风光':'🏞️','美食探店':'🍜',
+              '室内空间':'🏠','商品拍摄':'📦','其他场景':'🎨'}
+
+    def classify(self, img_rgb, face_count):
+        h, w = img_rgb.shape[:2]
+        hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+
+        # 特征
+        avg_sat = np.mean(hsv[:, :, 1])
+        avg_val = np.mean(hsv[:, :, 2])
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        edge_density = cv2.Canny(gray, 50, 150).sum() / gray.size
+
+        # 暖色调占比（美食特征）
+        warm_mask = (hsv[:,:,0] < 30) | ((hsv[:,:,0] > 150) & (hsv[:,:,0] < 180))
+        warm_ratio = warm_mask.sum() / warm_mask.size
+
+        # 绿色占比（风景特征）
+        green_mask = (hsv[:,:,0] > 35) & (hsv[:,:,0] < 85) & (hsv[:,:,1] > 40)
+        green_ratio = green_mask.sum() / green_mask.size
+
+        # 判断
+        if face_count == 1 and avg_val > 80:
+            return '人像写真'
+        if face_count >= 3:
+            return '集体照'
+        if face_count == 0:
+            if green_ratio > 0.2:
+                return '风景风光'
+            if warm_ratio > 0.5 and avg_sat > 60:
+                return '美食探店'
+            if edge_density < 0.03 and avg_val < 120:
+                return '室内空间'
+            if edge_density > 0.08 and avg_sat < 50:
+                return '商品拍摄'
+        if face_count == 2:
+            return '人像写真'
+        return '其他场景'
+
+
+# ═══════════════════════════════════════════
+# 多维度质量分析
+# ═══════════════════════════════════════════
+
+class QualityAnalyzer:
+    """多维图片质量评分：综合/人像/技术/构图/美学"""
+
+    def analyze(self, img_rgb, gray, face_results=None):
+        h, w = gray.shape
+        score = {}
+
+        # 1. 技术质量 (0-100)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sharpness = min(lap_var / 200 * 100, 100)
+
+        # 曝光
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+        cdf = hist.cumsum() / gray.size
+        shadows, midtones, highlights = cdf[30], cdf[200]-cdf[50], 1-cdf[220]
+        exposure = max(0, 100 - abs(shadows-0.1)*80 - abs(midtones-0.65)*80 - abs(highlights-0.1)*80)
+
+        # 噪点（高频成分）
+        blur = cv2.GaussianBlur(gray, (5, 5), 1.5)
+        noise = np.std(gray.astype(float) - blur.astype(float))
+        noise_score = max(0, 100 - noise * 5)
+
+        score['tech'] = {
+            'overall': round(sharpness*0.4 + exposure*0.35 + noise_score*0.25, 1),
+            'sharpness': round(sharpness, 1), 'exposure': round(exposure, 1),
+            'noise': round(noise_score, 1)
         }
 
-        if fh < 20 or fw < 20:
-            return result
+        # 2. 构图质量 (0-100)
+        # 三分法
+        edges = cv2.Sobel(gray, cv2.CV_64F, 1, 1)
+        edges_abs = np.abs(edges)
+        third_score = 0
+        for pos in [w//3, 2*w//3, h//3, 2*h//3]:
+            if pos < len(edges_abs.shape) and (pos < edges_abs.shape[1] if w//3 == pos else pos < edges_abs.shape[0]):
+                pass
+        line_energy = (np.sum(edges_abs[:, w//3-3:w//3+3]) + np.sum(edges_abs[:, 2*w//3-3:2*w//3+3]) +
+                       np.sum(edges_abs[h//3-3:h//3+3, :]) + np.sum(edges_abs[2*h//3-3:2*h//3+3, :]))
+        total_energy = np.sum(edges_abs) + 1e-8
+        third_score = min(line_energy / total_energy * 150, 100)
 
-        # 1. 眼睛张开度（Haar在人脸上半部检测眼睛）
-        upper = face_roi[:fh // 2, :]
-        eyes = self.eye_cascade.detectMultiScale(upper, 1.05, 4, minSize=(10, 10))
-        eye_count = min(len(eyes), 2)
-        result['eye_open'] = (eye_count / 2) * 100
+        # 画面平衡（左右亮度差）
+        left_bright = np.mean(gray[:, :w//2])
+        right_bright = np.mean(gray[:, w//2:])
+        balance = max(0, 100 - abs(left_bright - right_bright) * 4)
 
-        # 2. 头部角度估计（人脸框宽高比 + 偏移）
-        aspect = fw / max(fh, 1)
-        # 正面人脸宽高比约 0.7-0.85，偏离越大角度越大
-        ideal_aspect = 0.78
-        angle_est = min(abs(aspect - ideal_aspect) / 0.3 * 45, 90)
-        result['head_angle'] = round(angle_est, 1)
+        score['composition'] = {
+            'overall': round(third_score*0.5 + balance*0.5, 1),
+            'rule_of_thirds': round(third_score, 1),
+            'balance': round(balance, 1)
+        }
 
-        # 3. 人脸光照均匀度
-        hist = cv2.calcHist([face_roi], [0], None, [64], [0, 256])
-        hist_norm = hist / hist.sum()
-        # 低熵 = 光照不均匀
-        entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-8))
-        max_entropy = np.log2(64)
-        result['lighting_score'] = round((entropy / max_entropy) * 100, 1)
+        # 3. 人像质量 (0-100)
+        if face_results and len(face_results) > 0:
+            eyes_avg, face_angles, face_lights, face_scores = [], [], [], []
+            for fr in face_results:
+                if 'eyes_open' in fr:
+                    eyes_avg.append(fr['eyes_open'])
+                if 'head_angle' in fr:
+                    face_angles.append(fr['head_angle'])
+                if 'lighting' in fr:
+                    face_lights.append(fr['lighting'])
+                face_scores.append(fr.get('score', 80))
+            eye_ok = np.mean(eyes_avg) if eyes_avg else 100
+            angle_ok = max(0, 100 - np.mean(face_angles) * 2) if face_angles else 100
+            light_ok = np.mean(face_lights) if face_lights else 80
+            score['portrait'] = {
+                'overall': round(eye_ok*0.35 + angle_ok*0.3 + light_ok*0.2 + np.mean(face_scores)*0.15, 1),
+                'eyes': round(eye_ok, 1), 'angle': round(angle_ok, 1),
+                'lighting': round(light_ok, 1)
+            }
+        else:
+            score['portrait'] = {'overall': 0, 'eyes': 0, 'angle': 0, 'lighting': 0}
 
-        # 综合分
-        result['overall'] = round(
-            result['eye_open'] * 0.4 +
-            (100 - min(result['head_angle'] / 90 * 100, 100)) * 0.3 +
-            result['lighting_score'] * 0.3, 1)
+        # 4. 美学评分 (0-10)
+        hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+        avg_s = np.mean(hsv[:,:,1]) / 255
+        color_var = np.std(hsv[:,:,0].astype(float)) / 90
+        color_score = min(avg_s * 8 + color_var * 2, 10)
+        aesthetic = round(sharpness/100 * 2.5 + exposure/100 * 2.5 + color_score + third_score/100 * 2.5, 1)
+        score['aesthetic'] = round(max(0, min(10, aesthetic)), 1)
 
-        return result
+        # 5. 综合评分 (0-100)
+        weights = {'tech': 0.3, 'composition': 0.25, 'portrait': 0.25, 'aesthetic': 0.2}
+        overall = (score['tech']['overall'] * 0.3 + score['composition']['overall'] * 0.25 +
+                   (score['portrait']['overall'] if score['portrait']['overall'] > 0 else 70) * 0.15 +
+                   score['aesthetic'] * 10 * 0.2 +
+                   (sharpness * 0.1))
+        score['overall'] = round(overall, 1)
 
+        # 等级
+        if score['overall'] >= 90: score['grade'] = 'A 优秀'
+        elif score['overall'] >= 75: score['grade'] = 'B 良好'
+        elif score['overall'] >= 60: score['grade'] = 'C 一般'
+        else: score['grade'] = 'D 较差'
 
-# ═══════════════════════════════════════════
-# 美学评分（启发式 NIMA 风格）
-# ═══════════════════════════════════════════
+        return score
 
-class AestheticScorer:
-    """美学评分器：规则三分法 + 色彩和谐 + 曝光 + 清晰度 → 0-10分"""
-
-    def score(self, img_rgb):
-        h, w = img_rgb.shape[:2]
-
-        # 1. 三分法构图分
-        comp_score = self._rule_of_thirds(img_rgb)
-
-        # 2. 色彩和谐分
-        color_score = self._color_harmony(img_rgb)
-
-        # 3. 曝光分
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        exp_score = self._exposure_quality(gray)
-
-        # 4. 清晰度分
-        sharp_score = self._sharpness(gray)
-
-        # 加权合成（NIMA 风）
-        aesthetic = (
-            comp_score * 0.25 +
-            color_score * 0.25 +
-            exp_score * 0.25 +
-            sharp_score * 0.25
-        )
-        return round(aesthetic, 1)
-
-    def _rule_of_thirds(self, img):
-        """三分法构图评估"""
-        h, w = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-        # Sobel 边缘检测
-        edges = cv2.Sobel(gray, cv2.CV_64F, 1, 1, ksize=3)
-        edges = np.abs(edges)
-
-        # 三分线位置
-        v1, v2 = w // 3, 2 * w // 3
-        h1, h2 = h // 3, 2 * h // 3
-
-        # 三分线上的边缘强度 vs 整体
-        total = np.sum(edges) + 1e-8
-        on_lines = (
-            np.sum(edges[:, v1-3:v1+3]) + np.sum(edges[:, v2-3:v2+3]) +
-            np.sum(edges[h1-3:h1+3, :]) + np.sum(edges[h2-3:h2+3, :])
-        )
-        ratio = on_lines / total
-        return min(ratio * 15, 10)  # 映射到0-10
-
-    def _color_harmony(self, img):
-        """色彩和谐评估（HSV色相分布）"""
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0].flatten()
-        sat = hsv[:, :, 1].flatten()
-
-        # 饱和度高且色相集中的图得分更高
-        avg_sat = np.mean(sat) / 255 * 10
-        hue_hist = np.histogram(hue, bins=36, range=(0, 180))[0]
-        hue_entropy = -np.sum((hue_hist / max(hue_hist.sum(), 1)) *
-                               np.log2(hue_hist / max(hue_hist.sum(), 1) + 1e-8))
-        hue_score = min(hue_entropy / 5 * 10, 10)
-
-        return (avg_sat + hue_score) / 2
-
-    def _exposure_quality(self, gray):
-        """曝光质量（直方图均衡度）"""
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-        cdf = hist.cumsum()
-        cdf_norm = cdf / cdf[-1]
-
-        # 理想曝光：中间调像素多，高光和阴影像素少但存在
-        shadows = cdf_norm[30]
-        midtones = cdf_norm[200] - cdf_norm[50]
-        highlights = 1 - cdf_norm[220]
-
-        score = 10 - abs(shadows - 0.1) * 10 - abs(midtones - 0.65) * 10 - abs(highlights - 0.1) * 10
-        return max(0, min(10, score))
-
-    def _sharpness(self, gray):
-        """清晰度评估"""
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        var = lap.var()
-        # 方差映射到0-10（~200 = good）
-        return min(var / 20, 10)
+    def suggest(self, score, scene, face_count, blur_type=''):
+        """生成改进建议"""
+        tips = []
+        if score['tech']['sharpness'] < 50:
+            tips.append('照片较模糊' + (f'({blur_type})' if blur_type else '，建议重拍'))
+        if score['tech']['exposure'] < 50:
+            tips.append('曝光不理想，建议调整曝光补偿或后期修正')
+        if score['composition']['rule_of_thirds'] < 40:
+            tips.append('构图可优化，建议将主体置于三分线位置')
+        if score['portrait'].get('eyes', 100) < 40:
+            tips.append('检测到人物闭眼或眯眼，建议重拍')
+        if score['portrait'].get('angle', 100) < 50:
+            tips.append('人脸角度偏大，建议正面拍摄')
+        if not tips:
+            if score['overall'] >= 85:
+                tips.append('整体质量良好，可直接使用')
+            else:
+                tips.append('整体质量中规中矩，可用于日常分享')
+        return tips
 
 
 # ═══════════════════════════════════════════
-# 模糊类型分类
-# ═══════════════════════════════════════════
-
-class BlurClassifier:
-    """二级模糊检测：区分失焦模糊 / 运动模糊 / 背景虚化"""
-
-    def classify(self, gray):
-        """
-        返回: {type: 'defocus'|'motion'|'bokeh'|'sharp', confidence: 0-100}
-        """
-        h, w = gray.shape
-
-        lap = cv2.Laplacian(gray, cv2.CV_64F)
-        lap_var = lap.var()
-
-        # 1. 全局清晰度判断
-        if lap_var > 200:
-            return {'type': 'sharp', 'confidence': 90}
-
-        # 2. 检测运动模糊（频域分析）
-        fft = np.fft.fft2(gray)
-        fft_shift = np.fft.fftshift(fft)
-        magnitude = np.log(np.abs(fft_shift) + 1)
-
-        # 运动模糊特征：频谱在某方向拉长（椭圆度大）
-        _, thresh = cv2.threshold(
-            (magnitude * 255 / magnitude.max()).astype(np.uint8), 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            cnt = max(contours, key=cv2.contourArea)
-            if len(cnt) >= 5:
-                (cx, cy), (ma, MA), angle = cv2.fitEllipse(cnt)
-                elongation = max(ma, MA) / min(ma, MA) if min(ma, MA) > 0 else 1
-                if elongation > 3.0:
-                    return {'type': 'motion_blur', 'confidence': min(round((elongation - 2) * 20), 100)}
-
-        # 3. 检测背景虚化（主体清晰+背景模糊）
-        if lap_var < 50:
-            return {'type': 'defocus', 'confidence': round(max(0, (100 - lap_var / 50 * 100)))}
-
-        # 尝试区分局部模糊 vs 全局模糊
-        # 分块检测
-        block_size = max(h, w) // 3
-        variances = []
-        for y in range(0, h, block_size):
-            for x in range(0, w, block_size):
-                block = gray[y:y+block_size, x:x+block_size]
-                if block.size > 100:
-                    variances.append(cv2.Laplacian(block, cv2.CV_64F).var())
-
-        if not variances:
-            return {'type': 'defocus', 'confidence': 50}
-
-        var_std = np.std(variances)
-        var_mean = np.mean(variances)
-
-        # 各块方差差异大 → 背景虚化（部分区域清晰部分模糊）
-        if var_std > var_mean * 0.5 and np.max(variances) > 200:
-            return {'type': 'bokeh', 'confidence': min(round(var_std / var_mean * 40), 100)}
-
-        # 全局模糊
-        return {'type': 'defocus', 'confidence': min(round(100 - lap_var / 3), 100)}
-
-
-# ═══════════════════════════════════════════
-# 统一 AI 检测接口
+# 统一接口
 # ═══════════════════════════════════════════
 
 class AIDetector:
-    """AI检测总控制器"""
-
-    def __init__(self, enable_ai=True, progress_callback=None):
+    def __init__(self, enable_ai=True, progress_cb=None):
         self.enable_ai = enable_ai and HAS_ONNX
         self.face_detector = None
-        self.face_analyzer = FaceAnalyzer()
-        self.aesthetic_scorer = AestheticScorer()
-        self.blur_classifier = BlurClassifier()
-        self.progress_cb = progress_callback
+        self.scene_classifier = SceneClassifier()
+        self.quality_analyzer = QualityAnalyzer()
+        self.progress_cb = progress_cb
 
         if self.enable_ai:
-            self._init_models()
+            self._init()
 
-    def _init_models(self):
-        """初始化/下载 AI 模型"""
-        if not HAS_ONNX:
-            return
-
-        if self.progress_cb:
-            self.progress_cb("检查 AI 模型...")
-
-        # UltraLight 人脸检测模型
-        ok = ensure_model_downloaded(ULTRALIGHT_URL, ULTRALIGHT_MODEL, self.progress_cb)
+    def _init(self):
+        ok = ensure_model(SCRFD_URL, SCRFD_PATH, self.progress_cb)
         if ok:
             try:
-                self.face_detector = UltraLightFace(ULTRALIGHT_MODEL)
-                if self.progress_cb:
-                    self.progress_cb("AI 模型就绪 ✓")
+                self.face_detector = SCRFD(SCRFD_PATH)
+                if self.progress_cb: self.progress_cb("SCRFD 就绪 ✓")
             except Exception as e:
-                if self.progress_cb:
-                    self.progress_cb(f"AI 模型加载失败: {e}")
-                self.face_detector = None
-        else:
-            if self.progress_cb:
-                self.progress_cb("AI 模型下载失败，使用传统检测")
+                if self.progress_cb: self.progress_cb(f"SCRFD失败: {e}")
 
-    def detect_faces(self, img_rgb):
-        """AI 人脸检测（自动回退 Haar）"""
+    def detect_faces(self, img):
         if self.face_detector:
-            try:
-                return self.face_detector.detect(img_rgb)
-            except Exception:
-                pass
-        return None  # 调用方回退到传统方法
+            try: return self.face_detector.detect(img, 0.5)
+            except: return None
+        return None
 
-    def analyze_face_quality(self, gray, face_box):
+    def analyze_face(self, face_data):
         """分析单张人脸质量"""
-        return self.face_analyzer.analyze(gray, face_box)
+        result = {'score': 80, 'eyes_open': 100, 'head_angle': 0, 'lighting': 80}
+        if not face_data: return result
 
-    def score_aesthetic(self, img_rgb):
-        """美学评分 0-10"""
-        return self.aesthetic_scorer.score(img_rgb)
+        kps = face_data.get('kps', [])
+        box = face_data.get('box', (0,0,100,100))
+        x1,y1,x2,y2 = box
+        fw, fh = x2-x1, y2-y1
 
-    def classify_blur(self, gray):
-        """模糊类型分类"""
-        return self.blur_classifier.classify(gray)
+        # EAR from keypoints (leye=0, reye=1)
+        if len(kps) >= 2:
+            leye = np.array(kps[0])
+            reye = np.array(kps[1])
+            # 近似EAR：眼距vs脸宽
+            eye_dist = np.linalg.norm(leye - reye)
+            ear_approx = min(1.0, eye_dist / max(fw, 1) * 2.5)
+            result['eyes_open'] = round(min(ear_approx * 100, 100), 1)
 
+        # 角度（眼连线vs水平）
+        if len(kps) >= 2:
+            dx, dy = np.array(kps[1]) - np.array(kps[0])
+            angle = abs(np.arctan2(dy, dx) * 180 / np.pi)
+            result['head_angle'] = round(angle, 1)
 
-# ═══════════════════════════════════════════
-# 测试入口
-# ═══════════════════════════════════════════
+        # 置信度分数
+        result['score'] = round(face_data.get('score', 0.8) * 100, 1)
+        result['box'] = box
 
-if __name__ == '__main__':
-    def progress(msg):
-        print(f"[AI] {msg}")
+        return result
 
-    detector = AIDetector(enable_ai=True, progress_callback=progress)
-    print(f"AI 启用: {detector.enable_ai}")
-    print(f"人脸检测: {'UltraLight ONNX' if detector.face_detector else 'Haar fallback'}")
-    print("AI 模块加载完成 ✓")
+    def classify_scene(self, img_rgb, face_count):
+        return self.scene_classifier.classify(img_rgb, face_count)
+
+    def analyze_quality(self, img_rgb, gray, face_results):
+        return self.quality_analyzer.analyze(img_rgb, gray, face_results)
+
+    def suggest(self, score, scene, face_count, blur_type=''):
+        return self.quality_analyzer.suggest(score, scene, face_count, blur_type)
