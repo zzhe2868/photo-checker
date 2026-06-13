@@ -1,11 +1,10 @@
 @echo off
 chcp 65001 >nul
-title 照片废片检测工具
+title 照片废片检测工具 v3.0
 echo.
-echo   正在启动照片废片检测工具...
+echo   正在启动照片废片检测工具 v3.0...
 echo.
 
-:: 检查 Python
 py --version >nul 2>&1
 if %errorlevel% neq 0 (
     echo   [错误] 未找到 Python
@@ -14,7 +13,6 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: 启动
 py "%~dp0photo_checker.py"
 if %errorlevel% neq 0 (
     echo.
