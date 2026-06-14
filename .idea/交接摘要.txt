@@ -1,0 +1,111 @@
+图片智能分析系统（photo-checker）交接摘要
+
+一、项目概述
+
+图片智能分析系统是一个纯本地运行的桌面应用，用于自动扫描指定文件夹中的照片，检测并标记"废片"（模糊、闭眼、过曝/欠曝、重复、纯黑/纯白、灰暗、过饱和、异常值），将其移至 _废片/ 子文件夹，并提供多维度质量评分与改进建议。全程离线运行，保护隐私。
+
+当前版本：v5.0
+
+二、核心设定
+
+- 技术栈：Python 3.x + tkinter（自制暗黑电竞风主题）+ OpenCV + Pillow + ONNX Runtime + urllib
+- 部署方式：Windows 一键启动（启动照片检测.bat），无需虚拟环境或打包工具
+- 模型依赖：models/scrfd_2.5g_bnkps.onnx（人脸+关键点，3.6MB）、models/ultraface_rfb_640.onnx（备用）
+- 可选AI能力：通过 Ollama 接入本地 Qwen2.5-VL（3B/7B/72B），提供深度视觉分析与结构化评分
+- 配置存储：config.ini（INI格式，Config类统一管理阈值/URL/超时等全部参数）
+- 设计原则：100% 本地离线、高 DPI 适配、暗黑电竞风 UI、异常容错
+
+三、v5.0 新增（借鉴 cleanvision）
+
+1. 模块化检测引擎（inspectors.py，新增）
+   - 借鉴 cleanvision ImageInspection 设计模式，每个检测项独立为一个 Inspector 类
+   - InspectionPipeline：统一编排所有 inspector，类似 cleanvision 的 get_issues()
+   - OutlierInspector：数据集级异常值检测（基于 z-score），扫描结束后在数据集维度找出异常图片
+   - PatternRepeatInspector：结构重复检测（block correlation），补 pHash 重复的盲区
+
+2. 新增检测能力（cleanvision 启发）
+   - 灰度过低（MonochromeInspector）：HSV 饱和度分布检测接近灰度的照片
+   - 颜色过饱和（ColorfulInspector）：检测大面积颜色过度饱和的区域
+   - 过暗/过亮（ToneInspector）：perceptual brightness 维度，不同于局部像素比例的过曝/欠曝
+   - 结构重复（PatternRepeatInspector）：64×64 block 网格 Pearson 相关性检测规律性重复纹理
+
+3. 数据集异常值检测
+   - 扫描完成后自动检测：亮度/饱和度/清晰度/噪点/尺寸/宽高比 六个维度
+   - z-score > 2.5 标记为异常值（可在参数面板调节阈值）
+   - 异常值自动加入废片候选列表
+   - 结果在统计栏显示 "Outlier: N"
+
+四、已完成功能
+
+1. 检测引擎（ai_detector.py，600+行）
+   - 传统CV检测：Laplacian方差测模糊（含分类：失焦/运动模糊）、直方图测过曝/欠曝
+   - 纯黑/纯白图片检测：整图像素均值/方差判断
+   - 信息量极低图片检测：HSV色域方差、边缘密度判断
+   - pHash重复检测：感知哈希算法分组相似图片
+   - EXIF方向修正：自动纠正手机拍摄90度旋转问题
+   - SCRFD人脸检测：ONNX模型检测人脸 + 5关键点（左眼/右眼/鼻尖/嘴角x2）
+   - EAR闭眼判定：基于关键点计算眼纵横比，判断是否闭眼
+   - 头部角度估计：双眼连线与水平线夹角，检测歪头
+   - 场景分类：7类（人像写真/集体照/风景/美食/室内/商品/其他）
+   - 多维度质量评分（0-100）：技术（锐度/曝光/噪点）、构图（三分法/平衡）、人像（睁眼/角度/光线）、美学（饱和度/色彩方差）
+   - AI建议生成：根据场景类型给出针对性改进提示
+
+2. AI视觉分析（ollama_vl.py，280+行）
+   - Ollama 服务状态检测（/api/tags）
+   - 模型下载（/api/pull）与运行检查
+   - 图片转 Base64 + /api/chat 调用 Qwen2.5-VL，支持超时与重试
+   - JSON 响应解析（兼容 Markdown 代码块包裹格式）
+   - v5.0 改进：_pull_model 增加指数退避重试（2s/4s/8s），最多3次
+   - v5.0 改进：用户可通过参数面板自定义 Ollama API 超时时间
+   - v5.0 改进：analyze_batch 真正使用 batch_size 参数进行批次控制
+
+3. 主程序（photo_checker.py，1550+行）
+   - 文件夹扫描：递归遍历、进度条、暂停/恢复/停止（多线程）、进度估算
+   - 图片预览：三策略回退（PIL -> OpenCV -> matplotlib），GC 回收防护
+   - EXIF元数据展示：相机型号/ISO/光圈/快门/焦距
+   - 废片管理：移动至 _废片/ + 撤销恢复
+   - 批量操作：全选/反选/按分数范围选择
+   - 排序筛选：按分数/文件名/问题数量排序；按废片/合格/全部过滤
+   - 报告窗口：双击打开分栏报告（大图+分数条+问题列表+建议）
+   - CSV导出：多行导出全部分析结果
+   - 审计日志：AI审核日志.json 记录移动操作的完整分析详情
+   - 参数调节面板：右侧滑出面板，滑块调节所有检测阈值（含新增 Ollama 超时滑块）
+   - AI深度扫描开关：用户可选择每张照片调用 Qwen 深度分析
+   - AI模型管理器：浏览/下载/启用 Qwen-VL 模型
+   - Ollama部署引导：3步引导式安装（下载→检测→拉取模型）
+   - 欢迎页 + 新手引导：首次启动欢迎页，3步流程（选择文件夹→扫描→查看废片）
+   - 异常容错：每项检测独立 try-except，损坏文件跳过，扫描结束弹窗汇总失败清单
+   - 欢迎页：首次启动检测SCRFD模型，一键下载，引导完成标记
+   - v5.0 改进：重复组显示全部文件名（不再限制前4个）
+
+五、文件结构
+
+```
+photo-checker/
+├── photo_checker.py     # 主程序（GUI + 扫描逻辑）
+├── ai_detector.py       # AI 检测模块（SCRFD + 质量评分 + InspectionPipeline 集成）
+├── ollama_vl.py         # Ollama Qwen2.5-VL 视觉分析
+├── inspectors.py        # v5.0 新增：模块化检测引擎（8个 Inspector 类）
+├── config.ini           # 配置文件
+├── requirements_photo.txt
+├── models/              # ONNX 模型目录
+│   └── scrfd_2.5g_bnkps.onnx
+└── 交接摘要.txt
+```
+
+六、注意事项
+
+- 入口文件：photo_checker.py（约1550行），启动照片检测.bat 为日常启动方式
+- 依赖安装：pip install -r requirements_photo.txt（opencv-python, numpy, Pillow, onnxruntime）；ttkbootstrap 在列表中但未使用
+- 线程安全：扫描线程与 GUI 线程分离，通过 root.after() 回调更新 UI
+- 内存注意：大文件夹扫描时预览占用内存，三策略回退机制已处理
+- 异常处理：check_single 中每项检测独立 try-except，损坏文件/权限不足自动跳过，扫描结束弹窗汇总
+- Qwen 深度扫描需 Ollama 服务 + Qwen2.5-VL 模型（7B 建议 >=8GB 显存）
+- config.ini 全部配置由 Config 类统一管理（阈值/URL/路径/超时），无硬编码散落在代码中
+- gitignore：已忽略 _废片/ 目录
+
+七、v5.0 已知待完善项
+
+1. 无单元测试：零测试文件（后续考虑 pytest）
+2. 无打包方案：无 pyproject.toml / setup.py / venv
+3. 异常值检测仅在扫描完成后运行，无法实时显示（可接受的设计取舍）
